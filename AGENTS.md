@@ -107,4 +107,5 @@ schema, the executor or `config.yaml`. The CI workflow in
 - *"Add a new instrument"*: follow `docs/adding-an-instrument.md` step by
   step: a driver package under `src/devices/`, a mock counterpart, registration
   with `SharedDevices` / `MockSharedDevices`, the flow schema and executor, the
-  run-log column, configuration keys, tests and documentation.
+  run-log column, configuration keys, tests, documentation and, if the step
+  should be available from the GUI, the block palette in `src/gui/app.py`.

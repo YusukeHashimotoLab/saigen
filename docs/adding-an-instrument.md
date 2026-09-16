@@ -131,7 +131,29 @@ python -m src.flow.run_flow <your flow>.json --validate-only
 python -m src.flow.run_flow <your flow>.json --mock
 ```
 
-## 7. Documentation
+## 7. GUI (optional): `src/gui/app.py`
+
+The steps above make the action usable from JSON flows, the CSV runner and the
+flow-generating agent. The Streamlit GUI has its own block palette and needs
+three more edits, all in `src/gui/app.py`, only if users should be able to add
+the step from the GUI:
+
+- `ACTION_CONFIG`: an entry keyed by the action name with an icon, a Japanese
+  label and the default parameters, e.g.
+  `"measure_voltage": {"icon": "🔋", "label": "電圧測定", "category": "sensor", "defaults": {"samples": 3}}`.
+- `CATEGORIES`: add the action name to the list of the group it should appear
+  under in the toolbox (`"sensor"` for the balance and camera).
+- `get_param_summary()` and `render_step_params()`: one `elif action == ...`
+  branch in each, the first returning a one-line summary of the parameters,
+  the second drawing the input widgets (copy the `measure_weight` branches).
+
+The GUI imports `SHARED_DEVICE_ACTIONS` from the executor, so a step whose
+action is in that set is created without a `robot_id` automatically. Validation
+and the Mock run in the GUI go through the same schema and executor as the CLI,
+so nothing else is needed. Verify with `streamlit run src/gui/app.py`: add the
+block, check the parameters, run *Mock*.
+
+## 8. Documentation
 
 - `docs/experimental-flow.md`: one row in the *Shared devices* table.
 - `src/devices/README.md`: one row in the driver table and the method in the
@@ -153,6 +175,7 @@ python -m src.flow.run_flow <your flow>.json --mock
 [ ] experiment_logger.py           result key -> CSV column
 [ ] config.py + config.example.yaml   port key
 [ ] tests/                         parser test + mock-run test
+[ ] src/gui/app.py (optional)      ACTION_CONFIG, CATEGORIES, two elif branches
 [ ] docs/experimental-flow.md, src/devices/README.md, docs/bom.md, docs/setup.md
 [ ] pytest, --validate-only, --mock all green
 ```
