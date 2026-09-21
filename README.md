@@ -139,6 +139,36 @@ The fine-tuned YOLOv8 weights and the training images are **not** included in th
 repository. `detection/README.md` describes how to fine-tune your own model for your
 setup.
 
+## Disclaimer
+
+SAIGEN is research software, shared so that others can reproduce and build on our
+work. It is provided "as is", without warranty of any kind; the full terms are in
+[`LICENSE`](LICENSE) for the code and in Section 5 of CC BY 4.0 for the CAD models and
+documentation. The authors and their institutions accept no liability for injury,
+damage to equipment, loss of samples or data, or any other loss arising from its use.
+
+- **It moves hardware and handles chemicals.** A real run drives robot arms, dispenses
+  liquids and may heat and stir them. Anyone running it is responsible for their own
+  risk assessment, for following the safety rules of their institution and the safety
+  data sheets of their reagents, and for supervising the cell while it operates.
+- **The safety layer is not a certified safety system.** The workspace validators and
+  the emergency stop reduce the chance of a collision inside the limits *you*
+  configure. They are not a substitute for guarding, a hardware emergency stop or
+  the manufacturers' instructions, and they know nothing about what is actually on
+  the bench. Measure your own cell, set your own limits, and always do a mock run
+  and a supervised dry run before using reagents.
+- **Review generated flows and code.** Flows drafted by the LLM agent, and changes
+  made by an AI coding agent, can be wrong in ways that validation does not catch
+  (a wrong volume, vial or temperature is still a valid flow). Read them before a
+  real run.
+- **The CAD models are untested outside our laboratory.** They were designed for our
+  instruments and printers; strength, fit, heat resistance and chemical resistance
+  depend on your material and print settings and are not guaranteed.
+- **No affiliation.** SAIGEN is not affiliated with, endorsed by or supported by the
+  manufacturers of the instruments it controls. Product names are trademarks of their
+  respective owners. Using this software may fall outside an instrument's intended use
+  and may affect its warranty; check with the manufacturer.
+
 ## Citing
 
 If you use SAIGEN, please cite the software using the metadata in
