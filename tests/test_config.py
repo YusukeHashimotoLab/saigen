@@ -35,8 +35,13 @@ def test_workspace_limits_are_published_values():
     assert ws["joint1_max"] == 135.0
 
 
-def test_example_yaml_and_defaults_are_identical():
-    """config.example.yaml と DEFAULTS のドリフト検出"""
+def test_example_yaml_and_defaults_are_identical(tmp_path, restore_config_path):
+    """config.example.yaml と DEFAULTS のドリフト検出
+
+    ラボ固有の config.yaml が置かれた PC でも壊れないよう、CONFIG_PATH を
+    存在しないパスに向けて config.example.yaml だけが読まれるようにする。
+    """
+    lab_config.CONFIG_PATH = str(tmp_path / "absent-config.yaml")
     assert lab_config.load_config(force_reload=True) == lab_config.DEFAULTS
 
 
