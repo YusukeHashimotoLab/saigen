@@ -83,6 +83,9 @@ TARE_DELAY_S = 1.0
 # runs.) The default is therefore 1, so a sheet that omits the row reproduces
 # the historical behaviour; a sheet that carries the row overrides it.
 ASPIRATE_SPEED_DEFAULT = 1
+# Duration of the optional blow-out after dispensing, milliseconds (fixed; same
+# value as BLOW_OUT_DELAY_MS in the lab version of this runner).
+BLOW_OUT_DELAY_MS = 3000
 
 
 # ======================================================================
@@ -145,6 +148,24 @@ PARAM_SPECS: Dict[str, dict] = {
     "robot2_angle_deg": {
         "type": float, "min": -360.0, "max": 360.0,
         "note": "Robot 2 base rotation from the source vial to the balance (-360 to 360 deg)",
+    },
+    "robot1_dispense_radial_mm": {
+        "type": float, "min": -100.0, "max": 100.0, "default": 0.0,
+        "note": "Robot 1 radial offset of the dispense position (mm), applied after "
+                "the rotation and before the Z descent; negative = towards the base. "
+                "Optional; 0 (no offset, the paper's sequence) if this row is missing",
+    },
+    "robot2_dispense_radial_mm": {
+        "type": float, "min": -100.0, "max": 100.0, "default": 0.0,
+        "note": "Robot 2 radial offset of the dispense position (mm), applied after "
+                "the rotation and before the Z descent; negative = towards the base. "
+                "Optional; 0 (no offset, the paper's sequence) if this row is missing",
+    },
+    "blow_out_after_dispense": {
+        "type": parse_bool, "default": False,
+        "note": "TRUE to blow out the tip after dispensing, before the mass is read "
+                "(same speed as the dispense). Optional; FALSE (the paper's "
+                "sequence) if this row is missing",
     },
     "capture_photo": {
         "type": parse_bool, "default": False,
@@ -227,21 +248,27 @@ def build_steps(params: dict) -> Tuple[List[dict], Dict[int, int]]:
         2  aspirate(volume, aspirate_speed)
         3  move_z(+aspirate_z_descent_mm)      rise
         4  rotate_relative(angle, "low")       swing over the vial on the balance
+        4a move_radial(robotN_dispense_radial_mm)   only if the offset is not 0
         5  move_z(-dispense_z_descent_mm)      descend into the vial
         6  tare_scale(delay=1.0)               tare with the tip already lowered
         7  dispense(volume, robotN_dispense_speed)
+        7a blow_out(go_home, speed, 3000 ms)   only if blow_out_after_dispense
         8  measure_weight(stabilization_count) read the mass before rising
         9  move_z(+dispense_z_descent_mm)      rise
        10  go_home()                           the home move also undoes the rotation
 
-    Robot 1 runs its ten steps first, then Robot 2; a robot whose volume is 0 is
-    skipped entirely. This is exactly the sequence of the lab runner
-    (`excel_runner/run_csv.py`, commit 4584333) that produced the paper's ZIF-8
-    batches: the tare happens immediately before the dispense at the lowered
+    Robot 1 runs its steps first, then Robot 2; a robot whose volume is 0 is
+    skipped entirely. Without 4a and 7a this is exactly the sequence of the lab
+    runner (`excel_runner/run_csv.py`, commit 4584333) that produced the paper's
+    ZIF-8 batches: the tare happens immediately before the dispense at the lowered
     position, the balance is read before the tip rises, there is no rotation back
-    (`go_home` returns the arm) and no photograph. Setting `capture_photo` to TRUE
-    appends a single `capture_and_save` after both robots, which is an addition
-    relative to the historical sequence.
+    (`go_home` returns the arm) and no photograph. Steps 4a and 7a are the two
+    additions the lab runner gained later (commit fc68096): a radial offset of the
+    dispense position, for fixtures where the vial on the balance is not exactly on
+    the rotation arc, and a blow-out of the tip before the mass is read. Both are
+    off by default. Setting `capture_photo` to TRUE appends a single
+    `capture_and_save` after both robots, also an addition relative to the
+    historical sequence.
 
     Returns:
         (steps, weight_step_owner) where weight_step_owner maps the 1-based index
@@ -261,21 +288,32 @@ def build_steps(params: dict) -> Tuple[List[dict], Dict[int, int]]:
             continue
         angle = params[f"robot{rid}_angle_deg"]
         dispense_speed = params[f"robot{rid}_dispense_speed"]
+        radial = params.get(f"robot{rid}_dispense_radial_mm", 0.0)
+        blow_out = params.get("blow_out_after_dispense", False)
         steps += [
             {"action": "move_z", "robot_id": rid, "distance": -za},
             {"action": "aspirate", "robot_id": rid, "volume": volume, "speed": asp_speed},
             {"action": "move_z", "robot_id": rid, "distance": za},
             {"action": "rotate_relative", "robot_id": rid, "angle": angle, "speed": "low"},
+        ]
+        if radial != 0:
+            steps.append({"action": "move_radial", "robot_id": rid, "distance": radial})
+        steps += [
             {"action": "move_z", "robot_id": rid, "distance": -zd},
             {"action": "tare_scale", "delay": TARE_DELAY_S},
             {"action": "dispense", "robot_id": rid, "volume": volume, "speed": dispense_speed},
-            {"action": "measure_weight",
-             "stabilization_count": DEFAULT_STABILIZATION_COUNT},
+        ]
+        if blow_out:
+            steps.append({"action": "blow_out", "robot_id": rid, "go_home": True,
+                          "speed": dispense_speed, "delay_ms": BLOW_OUT_DELAY_MS})
+        steps.append({"action": "measure_weight",
+                      "stabilization_count": DEFAULT_STABILIZATION_COUNT})
+        # 1-based index of the measure_weight step just appended
+        weight_step_owner[len(steps)] = rid
+        steps += [
             {"action": "move_z", "robot_id": rid, "distance": zd},
             {"action": "go_home", "robot_id": rid},
         ]
-        # the measure_weight is the 8th of the ten steps just appended
-        weight_step_owner[len(steps) - 2] = rid
 
     if steps and params.get("capture_photo"):
         steps.append({"action": "capture_and_save", "file_path": ""})

@@ -12,16 +12,19 @@ hand-written or LLM-generated JSON. The runner published here reproduces that
 sequence step for step.
 
 The experiment itself is fixed. The runner always performs the same ten steps per
-robot, Robot 1 first and then Robot 2, and only substitutes the numbers from the CSV:
+robot (plus two optional ones, 4a and 7a, that are off by default), Robot 1 first and
+then Robot 2, and only substitutes the numbers from the CSV:
 
     for each robot (1, then 2), if its volume is not 0:
         1  move_z(-aspirate_z_descent_mm)     lower onto its source vessel
         2  aspirate                           (robot*_volume_mL, aspirate_speed)
         3  move_z(+aspirate_z_descent_mm)     rise
         4  rotate_relative(angle, "low")      swing over the vial on the balance
+        4a move_radial(robot*_dispense_radial_mm)   only if the offset is not 0
         5  move_z(-dispense_z_descent_mm)     lower into the vial
         6  tare_scale(delay=1.0)              tare with the tip already lowered
         7  dispense                           (robot*_volume_mL, robot*_dispense_speed)
+        7a blow_out(speed = dispense speed, 3 s)    only if blow_out_after_dispense
         8  measure_weight                     read the mass BEFORE the tip rises
         9  move_z(+dispense_z_descent_mm)     rise
        10  go_home                            the home move also undoes the rotation
@@ -33,8 +36,11 @@ Three details of that order are easy to get wrong and are worth stating explicit
 the balance is tared **after** the tip is already down in the vial, not before the arm
 moves; the mass is read **before** the tip rises, so no vibration from the Z move
 enters the reading; and there is **no `rotate_relative` back** — `go_home` returns the
-arm. The photograph is not part of the historical sequence: `capture_photo` is off by
-default, so the default run is exactly the sequence the paper's batches used.
+arm. The photograph, the radial offset and the blow-out are not part of the historical
+sequence: `capture_photo`, `robot*_dispense_radial_mm` and `blow_out_after_dispense`
+are off by default, so the default run is exactly the sequence the paper's batches
+used, and a sheet that turns them on reproduces the lab's current procedure (see
+"Dispense-position offset and blow-out" below).
 
 `examples/zif8/zif8_two_solution_mixing_speed*.json` are the JSON equivalents of this
 sequence (plus one closing photograph); see
@@ -67,6 +73,9 @@ cp src/flow/csv_runner/control.example.csv src/flow/csv_runner/control.csv
 | `robot2_dispense_speed` | int | 1–9 | Robot 2 pipette speed for dispensing |
 | `robot1_angle_deg` | float | −360–360 | Robot 1 base rotation from the source vial to the balance |
 | `robot2_angle_deg` | float | −360–360 | Robot 2 base rotation from the source vial to the balance |
+| `robot1_dispense_radial_mm` | float | −100–100 | Radial offset of Robot 1's dispense position, applied after the rotation and before the Z descent; negative = towards the base. Optional row; **0** if absent |
+| `robot2_dispense_radial_mm` | float | −100–100 | Same for Robot 2. Optional row; **0** if absent |
+| `blow_out_after_dispense` | bool | TRUE/FALSE | Blow out the tip after dispensing, before the mass is read (same speed as the dispense, 3 s). Optional row; **FALSE** if absent |
 | `capture_photo` | bool | TRUE/FALSE | Photograph the vial once at the end of the run. Optional row; **FALSE** if absent |
 
 The ranges above mirror the constraints in `src/flow/schema.py`. Every value is
@@ -90,6 +99,19 @@ robots and written into the generated `aspirate` steps and into `results.csv` wi
 everything else. **Its default is 1**, so a sheet that leaves the row out reproduces
 the historical behaviour exactly; the CSV rows `robot*_dispense_speed` apply only to
 dispensing, which is the variable the published runs compare (1 / 5 / 9).
+
+### Dispense-position offset and blow-out
+
+Two optional rows reproduce the additions the lab runner gained after the paper's
+batches (lab commit fc68096). `robotN_dispense_radial_mm` inserts a `move_radial`
+step right after the rotation, before the Z descent: on a fixture where the vial on
+the balance does not sit exactly on the rotation arc, a negative value pulls the tip
+towards the base and a positive one pushes it outwards. `blow_out_after_dispense`
+inserts a `blow_out` step (piston to its end and back, at the dispense speed, 3 s)
+between the dispense and the weighing, so that liquid left in the tip is counted in
+the measured mass. Both are off by default, and with both off the generated steps are
+identical to the historical sequence. The extra moves go through the same schema and
+workspace checks as every other step.
 
 ### Validation, an addition over the lab version
 

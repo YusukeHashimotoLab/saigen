@@ -1,4 +1,4 @@
-parameter,value,note
+﻿parameter,value,note
 # provenance,,"The values below are the ones in the lab's committed control sheet (state at commit 4584333 of the internal runner), not necessarily the values of every ZIF-8 batch: robot2_dispense_speed was varied over 1 / 5 / 9 across the nine batches. Rows whose parameter starts with # are ignored by the runner."
 robot1_volume_mL,5,Robot 1 aspirate/dispense volume (0-10 mL; 0 skips Robot 1)
 robot2_volume_mL,5.0,Robot 2 aspirate/dispense volume (0-10 mL; 0 skips Robot 2)
@@ -9,4 +9,7 @@ robot1_dispense_speed,9,Robot 1 pipette speed for dispensing (1-9; 1 slowest 9 f
 robot2_dispense_speed,1,Robot 2 pipette speed for dispensing (1-9; 1 slowest 9 fastest). The published ZIF-8 runs compare 1 / 5 / 9 here
 robot1_angle_deg,90,Robot 1 base rotation from the source vial to the balance (-360 to 360 deg)
 robot2_angle_deg,-90,Robot 2 base rotation from the source vial to the balance (-360 to 360 deg)
+robot1_dispense_radial_mm,0,"Robot 1 radial offset of the dispense position (mm), applied after the rotation and before the Z descent; negative = towards the base (-100 to 100). Optional row; 0 - no offset, the paper's sequence - if it is missing. The lab's current fixture uses -15"
+robot2_dispense_radial_mm,0,"Robot 2 radial offset of the dispense position (mm); see robot1_dispense_radial_mm. Optional row; 0 if it is missing. The lab's current fixture uses -18"
+blow_out_after_dispense,FALSE,"TRUE to blow out the tip after dispensing and before the mass is read (same speed as the dispense, 3 s). Optional row; FALSE - the paper's sequence - if it is missing"
 capture_photo,FALSE,TRUE to photograph the vial once at the end of the run (needs a camera). Optional row; FALSE - the sequence used for the paper's runs - if it is missing

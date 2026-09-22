@@ -361,3 +361,133 @@ def test_workspace_violation_from_csv_fails_the_run(tmp_path, monkeypatch):
     import json
     meta = json.load(open(meta_path, encoding="utf-8"))
     assert meta["status"] == "failed"
+
+
+# ----------------------------------------------------------------------
+# Dispense-position offset and blow-out (the lab runner's later additions)
+# ----------------------------------------------------------------------
+LAB_EXTRAS = {
+    "robot1_dispense_radial_mm": "-15",
+    "robot2_dispense_radial_mm": "-18",
+    "blow_out_after_dispense": "1",
+}
+
+
+def test_extras_absent_reproduce_the_historical_sequence(tmp_path):
+    """A sheet without the new rows generates exactly the old ten steps per robot."""
+    path = write_control_csv(tmp_path / "control.csv", VALID_PARAMS)
+    params = load_params_from_csv(path)
+    assert params["robot1_dispense_radial_mm"] == 0.0
+    assert params["robot2_dispense_radial_mm"] == 0.0
+    assert params["blow_out_after_dispense"] is False
+
+    steps, weight_owner = build_steps(params)
+    assert len(steps) == 20
+    assert not any(s["action"] in ("move_radial", "blow_out") for s in steps)
+    assert weight_owner == {8: 1, 18: 2}
+
+
+def test_radial_offset_inserts_move_radial_after_the_rotation(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv", {**VALID_PARAMS, **LAB_EXTRAS,
+                                                         "blow_out_after_dispense": "0"})
+    steps, weight_owner = build_steps(load_params_from_csv(path))
+
+    r1 = steps[:11]
+    assert [s["action"] for s in r1] == [
+        "move_z", "aspirate", "move_z", "rotate_relative", "move_radial", "move_z",
+        "tare_scale", "dispense", "measure_weight", "move_z", "go_home",
+    ]
+    assert r1[4] == {"action": "move_radial", "robot_id": 1, "distance": -15.0}
+    r2 = steps[11:]
+    assert r2[4] == {"action": "move_radial", "robot_id": 2, "distance": -18.0}
+    # weighing indices follow the inserted steps (1-based)
+    assert weight_owner == {9: 1, 20: 2}
+    for index, rid in weight_owner.items():
+        assert steps[index - 1]["action"] == "measure_weight"
+
+
+def test_zero_radial_offset_for_one_robot_only(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv",
+                             {**VALID_PARAMS, "robot2_dispense_radial_mm": "12.5"})
+    steps, weight_owner = build_steps(load_params_from_csv(path))
+    radials = [s for s in steps if s["action"] == "move_radial"]
+    assert radials == [{"action": "move_radial", "robot_id": 2, "distance": 12.5}]
+    assert weight_owner == {8: 1, 19: 2}
+
+
+def test_blow_out_is_inserted_between_dispense_and_weighing(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv",
+                             {**VALID_PARAMS, "blow_out_after_dispense": "TRUE"})
+    params = load_params_from_csv(path)
+    steps, weight_owner = build_steps(params)
+
+    actions = [s["action"] for s in steps]
+    assert actions[:11] == [
+        "move_z", "aspirate", "move_z", "rotate_relative", "move_z",
+        "tare_scale", "dispense", "blow_out", "measure_weight", "move_z", "go_home",
+    ]
+    b1, b2 = [s for s in steps if s["action"] == "blow_out"]
+    assert b1 == {"action": "blow_out", "robot_id": 1, "go_home": True,
+                  "speed": params["robot1_dispense_speed"], "delay_ms": run_csv.BLOW_OUT_DELAY_MS}
+    assert b2["robot_id"] == 2 and b2["speed"] == params["robot2_dispense_speed"]
+    assert run_csv.BLOW_OUT_DELAY_MS == 3000
+    assert weight_owner == {9: 1, 20: 2}
+
+
+def test_lab_sheet_with_both_extras_validates_against_schema(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv", {**VALID_PARAMS, **LAB_EXTRAS})
+    params = load_params_from_csv(path)
+    workflow, weight_owner = build_workflow(params)
+    actions = [s.action for s in workflow.steps]
+    assert actions.count("move_radial") == 2
+    assert actions.count("blow_out") == 2
+    assert len(actions) == 24
+    assert weight_owner == {10: 1, 22: 2}
+
+
+def test_radial_offset_out_of_range_raises(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv",
+                             {**VALID_PARAMS, "robot1_dispense_radial_mm": "150"})
+    with pytest.raises(ValueError):
+        load_params_from_csv(path)
+
+
+def test_blow_out_rejects_a_non_boolean(tmp_path):
+    path = write_control_csv(tmp_path / "control.csv",
+                             {**VALID_PARAMS, "blow_out_after_dispense": "maybe"})
+    with pytest.raises(ValueError):
+        load_params_from_csv(path)
+
+
+def test_results_csv_contains_the_extras(tmp_path):
+    input_csv = write_control_csv(tmp_path / "control.csv", {**VALID_PARAMS, **LAB_EXTRAS})
+    params = load_params_from_csv(input_csv)
+    out_path = write_results_csv(input_csv, params, {"robot1_weight_g": 5.0, "robot2_weight_g": 4.9})
+    with open(out_path, encoding="utf-8-sig", newline="") as f:
+        rows = {r["key"]: r["value"] for r in csv.DictReader(f)}
+    assert rows["robot1_dispense_radial_mm"] == "-15.0"
+    assert rows["robot2_dispense_radial_mm"] == "-18.0"
+    assert rows["blow_out_after_dispense"] == "True"
+
+
+def test_mock_run_with_the_lab_extras_completes(tmp_path, monkeypatch):
+    """End to end in mock mode with the offset and blow-out enabled: the extra
+    steps run through MockLabRobot and the two weighings still land in results."""
+    monkeypatch.setattr(run_csv, "LOGS_DIR", str(tmp_path / "logs"))
+    path = write_control_csv(tmp_path / "control.csv", {**VALID_PARAMS, **LAB_EXTRAS})
+
+    assert run_csv.main(["--csv", path, "--mock"]) == 0
+
+    run_dir = _latest_run_dir(str(tmp_path / "logs"))
+    with open(os.path.join(run_dir, "measurements.csv"),
+              encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    actions = [r["action"] for r in rows]
+    assert actions.count("move_radial") == 2
+    assert actions.count("blow_out") == 2
+    weights = [r for r in rows if r["action"] == "measure_weight" and r["weight_g"]]
+    assert len(weights) == 2
+
+    with open(tmp_path / "results.csv", encoding="utf-8-sig", newline="") as f:
+        results = {r["key"]: r["value"] for r in csv.DictReader(f)}
+    assert results["robot1_weight_g"] and results["robot2_weight_g"]
