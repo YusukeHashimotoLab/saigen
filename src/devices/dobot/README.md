@@ -5,6 +5,8 @@ Dobot Magician を `pydobot` ライブラリ経由（シリアル通信）で制
 
 ## ファイル
 
+- `home_dobot.py` — ホーミング CLI（`python -m src.devices.dobot.home_dobot --robot N`）
+
 | ファイル | 役割 |
 |---|---|
 | `pydobot_controller.py` | `PyDobotController` — 本体 |
@@ -46,6 +48,7 @@ PyDobotController.list_available_ports()
 | `set_gripper(enabled, on)` / `set_suction_cup(enabled, on)` | エンドエフェクタ |
 | `set_speed_preset(name)` | `DobotConfig.SPEED_PRESETS` の速度に切替 |
 | `move_to_work_position(name)` / `set_home_params(x, y, z, r)` | 定義済み位置 |
+| `home(x, y, z, r, timeout_s)` | ファームウェアのホーミング（SetHOMEParams / SetHOMECmd）。完了まで待ち、戻り先を省略すると開始位置に戻る |
 | `move_slider(pos)` | リニアレール（0–1000 mm） |
 | `move_conveyer(index, speed, time_seconds)` | コンベアベルト |
 | `get_current_position()` | `[x, y, z, r]` |
@@ -55,6 +58,9 @@ PyDobotController.list_available_ports()
 
 - 自動運転の前に、手動で可動域と周囲の安全を確認してください。
 - `homing=True` を指定するとホーミング動作で腕が動きます。障害物がないことを確認してください。
+  通常は電源投入後に CLI で 1 台ずつ行います:
+  `python -m src.devices.dobot.home_dobot --robot 1`（`--mock` で手順だけ確認、
+  実機では Enter を押すまで動きません）。戻り先は config.yaml の workspace で事前検証されます。
 - 実験用の安全ラッパ（`src/devices/safety/lab_robot.py`）はこのクラスを内部で使い、
   可動域チェックと待機時間を追加します。フロー実行時はラッパ経由で呼び出されます。
 - モーターから異音がした場合は直ちに `disconnect()` して物理的な干渉を確認してください。

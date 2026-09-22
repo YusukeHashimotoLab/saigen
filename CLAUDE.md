@@ -58,7 +58,9 @@ schema, the executor or `config.yaml`. The CI workflow in
 ## Rules
 
 1. **Never start a real run on your own.** Anything without `--mock` (or
-   without *Mock* in the GUI) moves a robot arm and dispenses liquid. Run
+   without *Mock* in the GUI) moves a robot arm and dispenses liquid; this
+   includes the homing tool `src/devices/dobot/home_dobot.py`, whose sweep is
+   decided by the firmware and cannot be checked by the validator. Run
    `--validate-only`, then `--mock`, and stop there. A real run happens only
    when the human explicitly asks for it in the current conversation, after the
    mock run succeeded, and it is the human who presses Enter. Ctrl+C is the

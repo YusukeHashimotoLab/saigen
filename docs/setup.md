@@ -91,6 +91,25 @@ python src/devices/picus2/test_picus2_minimal.py         # edit the port inside 
 python -m src.devices.scale.scale_controller             # reads the balance
 ```
 
+The Dobot Magician only knows its joint angles precisely after a **homing** run
+(the firmware drives joint 1 to its end stop and re-zeroes the encoders). Do it
+once after every power-on, one arm at a time, with the area around the arm clear:
+
+```bash
+python -m src.devices.dobot.home_dobot --robot 1 --mock   # rehearse the procedure, no hardware
+python -m src.devices.dobot.home_dobot --robot 1          # real: asks for Enter before the arm moves
+python -m src.devices.dobot.home_dobot --robot 2
+```
+
+The port comes from `config.yaml` (or `.env` / `--port`). `--target` chooses
+where the arm returns after homing: `current` (default, the pose it started
+from), `zero` (base angle 0°, same radius and height) or `config`
+(`DobotConfig.HOME_SETTINGS`). The return pose is checked against the
+`workspace` limits before anything is sent, and the tool refuses if it is
+outside. The homing sweep itself is decided by the firmware and cannot be
+validated, so keep the whole reach clear. Ctrl+C during the sweep is the same
+emergency stop as in a flow: the queue is force-stopped and the arm halts.
+
 For the arm, confirm the `workspace` section of `config.yaml` matches your fixtures
 before running any flow: every `move_xyz` / `move_z` / `rotate` target is checked
 against those limits **before** the robot is commanded, and a violation aborts the
@@ -119,6 +138,9 @@ pytest tests/
 
 ## 6. First run with hardware
 
+0. Home each arm once after power-on (`python -m src.devices.dobot.home_dobot
+   --robot N`, see §4). Without it the joint angles the firmware reports can be
+   off, and vertical `move_z` moves come out slanted.
 1. Move each arm by hand (or with the driver self-test) to the pose you want as
    *home*: pipette tip above the flask, clear of everything. The runner captures the
    current pose as home at start-up; `go_home` returns there.

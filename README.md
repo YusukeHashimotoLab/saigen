@@ -56,7 +56,10 @@ https://youtu.be/5X2-4LuQfns
 5. Install the Python dependencies: `pip install -r requirements.txt`
    (module-specific notes, e.g. for the imaging system, are in each `src/<module>/README.md`).
    Check the installation with `pytest tests/` — the suite needs no hardware.
-6. Dry-run a flow without hardware, then run it for real. The ZIF-8 examples are the
+6. After every power-on, home each arm once so the firmware's joint angles match the
+   real arm (`python -m src.devices.dobot.home_dobot --robot 1 --mock` to rehearse,
+   then without `--mock`; the arm sweeps to its joint-1 end stop, so clear the area).
+   Then dry-run a flow without hardware, then run it for real. The ZIF-8 examples are the
    JSON equivalents of the spreadsheet sequence in step 7, which is the path the
    paper's batches were actually run with:
 

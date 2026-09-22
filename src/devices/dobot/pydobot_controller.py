@@ -106,8 +106,9 @@ class PyDobotController:
             self.device._set_ptp_joint_params(*jv[:4], *ja[:4])
 
             if homing:
+                # pydobot 1.3.x には home() が無いので、自前の home() を使う
                 logger.info("Executing homing...")
-                self.device.home()
+                self.home()
 
         except Exception as e:
             logger.error(f"Failed to connect to Dobot on {self.port_name}: {e}")
@@ -422,6 +423,105 @@ class PyDobotController:
             self.move_angle(position["r"])
 
         return True
+
+    # Dobot プロトコル ID（Dobot Magician Communication Protocol v1.1.5）
+    _ID_SET_HOME_PARAMS = 30   # SetHOMEParams: ホーミング後に戻る座標 (x, y, z, r)
+    _ID_SET_HOME_CMD = 31      # SetHOMECmd:    ホーミング（原点復帰）を実行
+
+    def home(
+        self,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        z: Optional[float] = None,
+        r: Optional[float] = None,
+        timeout_s: float = 120.0,
+        poll_interval: float = 0.5,
+    ) -> List[float]:
+        """ファームウェアのホーミング（原点復帰）を実行し、完了まで待つ。
+
+        電源投入後に一度実行すると、エンコーダ基準の関節角が実機と一致し、
+        XYZ 直線補間（MOVL）が正しい鉛直・水平になる。pydobot 1.3.x には
+        ホーミング API が無いため、Dobot プロトコルの SetHOMEParams (ID 30) と
+        SetHOMECmd (ID 31) をキュー付きで直接送信する。
+
+        注意:
+            ホーミング中はアームが J1 の限界まで大きく振れる。周囲を空けてから
+            呼ぶこと。ホーミングそのものの軌道はファームウェアが決めるので
+            WorkspaceValidator では検証できない。検証できるのは戻り先
+            (x, y, z, r) だけであり、それは呼び出し側（home_dobot CLI）が行う。
+
+        Args:
+            x, y, z, r: ホーミング完了後にアームが戻る座標。省略した軸は
+                呼び出し時点の現在値を使う（既定: 開始位置に戻る）。
+            timeout_s: 完了待ちの上限秒。超えると TimeoutError。
+            poll_interval: キュー進捗のポーリング間隔（秒）。
+
+        Returns:
+            list: 完了後の [x, y, z, r, joint1, joint2, joint3, joint4]
+
+        Raises:
+            ConnectionError: 未接続、またはコマンドに応答が無い
+            TimeoutError: timeout_s 以内にホーミングが完了しない
+        """
+        device = self._require_device()
+        from pydobot.message import Message
+
+        pose = self._safe_pose()
+        target = [
+            pose[0] if x is None else float(x),
+            pose[1] if y is None else float(y),
+            pose[2] if z is None else float(z),
+            pose[3] if r is None else float(r),
+        ]
+        logger.info(
+            f"[PyDobot] homing: start pose X={pose[0]:.1f} Y={pose[1]:.1f} "
+            f"Z={pose[2]:.1f} R={pose[3]:.1f}; return target X={target[0]:.1f} "
+            f"Y={target[1]:.1f} Z={target[2]:.1f} R={target[3]:.1f}"
+        )
+
+        # 1. SetHOMEParams (ID 30, rw=1, isQueued=1): ホーミング後の戻り先
+        msg = Message()
+        msg.id = self._ID_SET_HOME_PARAMS
+        msg.ctrl = 0x03
+        msg.params = bytearray()
+        for v in target:
+            msg.params.extend(bytearray(struct.pack('<f', v)))
+        if device._send_command(msg) is None:
+            raise ConnectionError("Dobot: SetHOMEParams に応答がありません")
+
+        # 2. SetHOMECmd (ID 31, rw=1, isQueued=1): 応答はキュー index (uint64)
+        msg = Message()
+        msg.id = self._ID_SET_HOME_CMD
+        msg.ctrl = 0x03
+        msg.params = bytearray(struct.pack('<I', 0))  # reserved
+        response = device._send_command(msg)
+        if response is None or len(response.params) < 4:
+            raise ConnectionError("Dobot: SetHOMECmd に応答がありません")
+        raw = bytes(response.params[:8]).ljust(8, b"\x00")
+        expected_idx = struct.unpack('<Q', raw)[0]
+        logger.info(f"[PyDobot] homing started (queue index {expected_idx}); the arm will swing widely")
+
+        # 3. キューの現在 index が SetHOMECmd の index に達するまで待つ
+        t0 = time.monotonic()
+        while True:
+            current_idx = device._get_queued_cmd_current_index()
+            if current_idx >= expected_idx:
+                break
+            if time.monotonic() - t0 > timeout_s:
+                raise TimeoutError(
+                    f"Dobot: ホーミングが {timeout_s:.0f}s 以内に完了しません "
+                    f"(queue index {current_idx} / {expected_idx})"
+                )
+            time.sleep(poll_interval)
+        time.sleep(min(1.0, max(poll_interval, 0.0)))
+
+        final = list(self._safe_pose())
+        logger.info(
+            f"[PyDobot] homing done in {time.monotonic() - t0:.0f}s: "
+            f"X={final[0]:.1f} Y={final[1]:.1f} Z={final[2]:.1f} R={final[3]:.1f} "
+            f"J1={final[4]:.1f} J2={final[5]:.1f} J3={final[6]:.1f} J4={final[7]:.1f}"
+        )
+        return final
 
     def set_home_params(self, x: float, y: float, z: float, r: float) -> bool:
         """
