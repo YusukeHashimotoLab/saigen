@@ -131,6 +131,10 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         if not file_path:
             file_path = None
         saved_path = await shared_devices.capture_and_save(file_path)
+        if not saved_path:
+            # SharedDevices は失敗時に None を返す。成功扱いにすると画像の無い
+            # 「ok」ステップが記録に残るので、ステップの失敗として止める
+            raise RuntimeError("カメラ撮影に失敗しました（画像が保存されませんでした）")
         return {"image_path": saved_path}
 
     # ===== デジタル顕微鏡操作 =====
@@ -139,6 +143,8 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         if not file_path:
             file_path = None
         saved_path = await shared_devices.capture_microscope(file_path)
+        if not saved_path:
+            raise RuntimeError("顕微鏡撮影に失敗しました（画像が保存されませんでした）")
         return {"image_path": saved_path}
 
     elif action == "microscope_led":

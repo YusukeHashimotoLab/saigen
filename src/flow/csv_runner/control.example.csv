@@ -1,7 +1,7 @@
 ﻿parameter,value,note
-# provenance,,"The values below are the ones in the lab's committed control sheet (state at commit 4584333 of the internal runner), not necessarily the values of every ZIF-8 batch: robot2_dispense_speed was varied over 1 / 5 / 9 across the nine batches. Rows whose parameter starts with # are ignored by the runner."
-robot1_volume_mL,5,Robot 1 aspirate/dispense volume (0-10 mL; 0 skips Robot 1)
-robot2_volume_mL,5.0,Robot 2 aspirate/dispense volume (0-10 mL; 0 skips Robot 2)
+# provenance,,"The values below are the ones in the lab's committed control sheet (state at commit 4584333 of the internal runner), not necessarily the values of every ZIF-8 batch: robot2_dispense_speed was varied over 1 / 5 / 9 across the nine batches. Rows whose parameter starts with # are comments; any other unknown or repeated parameter name is an error."
+robot1_volume_mL,5,Robot 1 aspirate/dispense volume (0 skips Robot 1; otherwise 0.5-10 mL)
+robot2_volume_mL,5.0,Robot 2 aspirate/dispense volume (0 skips Robot 2; otherwise 0.5-10 mL)
 aspirate_z_descent_mm,0.1,Z descent onto the source vial before aspirating (0.1-200 mm)
 dispense_z_descent_mm,120,Z descent onto the vial on the balance before dispensing (0.1-200 mm)
 aspirate_speed,1,Pipette speed used for aspiration by both robots (1-9; 1 slowest). Optional row; 1 is used if it is missing - the value in force for the paper's runs

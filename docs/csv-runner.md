@@ -53,8 +53,13 @@ different order — is a JSON flow; see
 ## The CSV
 
 `parameter,value,note` — one row per parameter, and the `note` column is free text for
-the operator. Row order does not matter and unknown rows are ignored, so a lab can add
-its own comment rows. Copy the published example to your own working file:
+the operator. Row order does not matter. A row whose `parameter` cell is empty or
+starts with `#` is a comment and is ignored, so a lab can add its own notes that way.
+Every other row must name one of the parameters below **exactly once**: an unknown
+name (typically a typo such as `robot1_volume_ml`, which would otherwise leave the
+real row at its default) and a parameter given twice are both errors, reported with
+their line number in the file (the header is line 1). The optional rows listed below
+may still be left out. Copy the published example to your own working file:
 
 ```bash
 cp src/flow/csv_runner/control.example.csv src/flow/csv_runner/control.csv
@@ -64,8 +69,8 @@ cp src/flow/csv_runner/control.example.csv src/flow/csv_runner/control.csv
 
 | `parameter` | Type | Range | Meaning |
 |---|---|---|---|
-| `robot1_volume_mL` | float | 0–10 | Robot 1 aspirate/dispense volume. **0 skips Robot 1 entirely** |
-| `robot2_volume_mL` | float | 0–10 | Robot 2 aspirate/dispense volume. **0 skips Robot 2 entirely** |
+| `robot1_volume_mL` | float | 0, or 0.5–10 | Robot 1 aspirate/dispense volume. **0 skips Robot 1 entirely**; any other value must be at least the pipette wrapper's minimum of 0.5 mL |
+| `robot2_volume_mL` | float | 0, or 0.5–10 | Robot 2 aspirate/dispense volume. **0 skips Robot 2 entirely**; otherwise at least 0.5 mL |
 | `aspirate_z_descent_mm` | float | 0.1–200 | Z descent onto the source vial before aspirating |
 | `dispense_z_descent_mm` | float | 0.1–200 | Z descent onto the vial on the balance before dispensing |
 | `aspirate_speed` | int | 1–9 | Pipette speed used for aspiration by both robots. Optional row; **1** if absent |
@@ -83,7 +88,10 @@ converted and range-checked **before any device is opened**, and all problems in
 sheet are reported at once, so a typo can never reach the hardware.
 
 Being inside these ranges is not the same as being safe in *your* cell: the generated
-steps are checked again, move by move, against the `workspace` limits in `config.yaml`
+steps go through the same **workspace preflight** as a JSON flow (`run_flow.run_preflight`,
+before any device is opened, with `--validate-only` too; a violation exits with code 3).
+The fixed sequence consists only of relative moves, which the preflight lists as
+"unverified until run", so in practice they are checked move by move, against the `workspace` limits in `config.yaml`
 by the same `WorkspaceValidator` that guards the JSON flows (in `--mock` too). Set
 those limits for your own bench before a real run — see
 [`docs/setup.md`](setup.md).
@@ -150,7 +158,7 @@ a fresh clone.
 |---|---|
 | `--csv PATH` | input sheet (default: `control.csv`, else `control.example.csv`) |
 | `--mock` | run against simulated devices; recording is always off |
-| `--validate-only` | read the sheet and build the steps, then stop |
+| `--validate-only` | read the sheet, build and schema-check the steps and run the workspace preflight, then stop (no device is opened) |
 | `--record` / `--no-record` | sensor-CSV and video recording; on by default for real runs |
 | `--camera-index N` | camera used when `capture_photo` is TRUE (default: `CAMERA_INDEX` / `config.yaml`) |
 | `--liquid-density X` | density in g/mL used to turn dispensed volume into expected mass (default 1.0) |
@@ -171,11 +179,20 @@ A CSV run leaves behind exactly what a JSON run leaves behind, in the same place
         run.log                  full log of the run
         measurements.csv         one row per step (weights included)
         summary.md               human-readable report
-        metadata.json            status, robots used, counts
+        metadata.json            status, execution mode (mock/real), robots used,
+                                 counts, sensor-recording ownership
         dispense_accuracy.csv    expected vs. measured mass per dispense
         control.csv              a copy of the sheet the run was started from
         generated_flow.json      the exact steps that were executed
         images/                  (empty unless capture_photo is TRUE)
+
+`measurements.csv` has a `mode` column and `summary.md` states the execution mode,
+so a mock run can never be mistaken for measured data. Two runs started in the same
+second get separate folders (`…_<timestamp>_2`, `_3`, …); a run never writes into an
+existing folder. With recording on, the runner stops the dashboard's sensor recording
+at the end only if this run started it (`/api/start` answered 200); if a recording
+was already running (409) it is left alone, and `metadata.json` records which case
+applied (`sensor_recording.started_by_this_run`).
 
 `generated_flow.json` is a normal flow file: it can be re-run with
 `python -m src.flow.run_flow <that file>`, which makes a spreadsheet run reproducible

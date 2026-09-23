@@ -20,7 +20,16 @@ appended and the model is asked for a single JSON object at temperature 0.
 
 With `template=` (a preset's `template` dict) the model is instructed to change only
 the parameters of the given flow and keep the step order — the safest way to derive a
-new condition from a procedure already checked on hardware.
+new condition from a procedure already checked on hardware. The reply is then checked
+against the template (`check_template_structure`): the same number of steps, the same
+`action`, `robot_id` and `loop_id` in the same order. Any structural change raises
+`TemplateStructureError` with the offending steps, and the GUI shows the error and
+keeps the prompt; a failed generation never loads the unchanged template in its place.
+
+Rotation directions in the prompt are stated from a named viewpoint: positive
+`rotate_relative` is counter-clockwise seen from above (+Y), which for an operator
+standing in front of the robot and facing it ("operator facing the robot") moves the
+arm to the operator's right.
 
 The returned dict is **not** trusted: `src/flow/schema.py` validates it before
 anything moves, and the GUI shows it for review first.

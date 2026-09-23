@@ -12,6 +12,11 @@ L2層: 実験ログ管理クラス（ExperimentLogger）
         summary.md       天秤の測定値と画像を時系列でひも付けた人間可読レポート
         images/          このワークフローで撮影した画像（自動でこのフォルダへ束ねる）
 
+実行モード（"mock" / "real"）は metadata.json の ``mode``、measurements.csv の
+``mode`` 列、summary.md の概要に必ず残す（Mock の記録を実測と取り違えないため）。
+同じ秒に同名の実験が始まってもフォルダは共有せず、``_2``, ``_3`` ... を付けて
+別フォルダにする（既存フォルダへは決して書き込まない）。
+
 設計思想:
 - src/flow/run_flow.py から利用する。ロガーへの FileHandler 着脱もここで面倒を見る。
 - 各モジュール（executor / shared_devices / webcam 等）のログも漏らさず拾うため、
@@ -28,6 +33,42 @@ import time
 from datetime import datetime
 
 
+#: 実行モードの表記（metadata / CSV / summary で共通）
+MODES = ("mock", "real")
+_MODE_LABELS = {"mock": "MOCK（シミュレーション・実機なし）", "real": "REAL（実機）"}
+
+
+def _normalize_mode(mode) -> str:
+    if mode is None:
+        return "unspecified"
+    if isinstance(mode, bool):  # mock=True / False を直接渡された場合
+        return "mock" if mode else "real"
+    text = str(mode).strip().lower()
+    if text not in MODES:
+        raise ValueError(f"mode は {MODES} のいずれか: {mode!r}")
+    return text
+
+
+def _make_unique_dir(path: str) -> str:
+    """``path`` を新規作成して返す。既にあれば ``_2``, ``_3`` ... を付ける。
+
+    ``exist_ok=True`` は使わない: 同じ秒に始まった 2 つのランが 1 つのフォルダ
+    （run.log・measurements.csv）を共有してしまうため。
+    """
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)   # 日付フォルダは共有してよい
+    candidate, n = path, 1
+    while True:
+        try:
+            os.makedirs(candidate)
+            return candidate
+        except FileExistsError:
+            n += 1
+            if n > 9999:
+                raise
+            candidate = f"{path}_{n}"
+
+
 def _sanitize(name: str) -> str:
     """フォルダ名に使えない文字を除去（日本語はそのまま残す）"""
     name = name.strip() or "experiment"
@@ -42,8 +83,15 @@ class ExperimentLogger:
     LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
     def __init__(self, name: str, description: str, source_json_path: str,
-                 base_dir: str = "logs"):
+                 base_dir: str = "logs", mode=None):
+        """
+        Args:
+            mode: 実行モード "mock" / "real"（bool の mock フラグも可）。
+                省略時は "unspecified" と記録される。
+        """
         self.name = name
+        self.mode = _normalize_mode(mode)
+        self.recording = None      # センサー録画の所有情報（record_recording）
         self.description = description or ""
         self.source_json_path = source_json_path
 
@@ -53,9 +101,9 @@ class ExperimentLogger:
         date_dir = self.started_at.strftime("%Y-%m-%d")
         timestamp = self.started_at.strftime("%Y%m%d_%H%M%S")
         folder = f"{_sanitize(name)}_{timestamp}"
-        self.dir = os.path.abspath(os.path.join(base_dir, date_dir, folder))
+        self.dir = _make_unique_dir(os.path.abspath(os.path.join(base_dir, date_dir, folder)))
         self.images_dir = os.path.join(self.dir, "images")
-        os.makedirs(self.images_dir, exist_ok=True)
+        os.makedirs(self.images_dir)
 
         # 経過時間計測用（壁時計とは別に単調増加クロックを使う）
         self._t0 = time.monotonic()
@@ -98,6 +146,14 @@ class ExperimentLogger:
         self.robots_used = set(robot_ids)
         self.picus2_robots = set(picus2_robots)
 
+    def record_recording(self, info: dict):
+        """センサー CSV 録画の情報を残す（``started_by_this_run`` など）。
+
+        このランが開始していない録画（/api/start が 409）は止めない、という
+        判断の根拠を後から確認できるようにする。
+        """
+        self.recording = dict(info) if info is not None else None
+
     def record_step(self, index, total, action, robot_id, iteration,
                     status, duration, result=None, error=None):
         """1ステップの実行結果を記録
@@ -121,9 +177,15 @@ class ExperimentLogger:
         nominal_time = result.get("nominal_time_s")
         focus_position = result.get("focus_position")
         focus_converged = result.get("focus_converged")
+        # 撮影ステップが「画像なし」で成功扱いになるのを防ぐ（executor も例外に
+        # するが、戻り値だけを渡す呼び出し側があっても記録を誤らせない）
+        if status == "ok" and "image_path" in result and not image_path:
+            status = "error"
+            error = error or "撮影に失敗しました（画像パスが返りませんでした）"
 
         record = {
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": self.mode,
             "elapsed_s": round(elapsed, 2),
             "step_index": index,
             "total_steps": total,
@@ -188,7 +250,7 @@ class ExperimentLogger:
         return (self.finished_at - self.started_at).total_seconds()
 
     def _write_csv(self):
-        fields = ["timestamp", "elapsed_s", "step_index", "total_steps",
+        fields = ["timestamp", "mode", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
                   "focus_converged", "error"]
@@ -204,6 +266,7 @@ class ExperimentLogger:
         meta = {
             "name": self.name,
             "description": self.description,
+            "mode": self.mode,
             "source_json": os.path.abspath(self.source_json_path),
             "started_at": self.started_at.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": self.finished_at.strftime("%Y-%m-%d %H:%M:%S")
@@ -218,6 +281,7 @@ class ExperimentLogger:
             "picus2_robots": sorted(self.picus2_robots),
             "weight_measurements": len(weights),
             "images_captured": len(images),
+            "sensor_recording": self.recording,
             "output_files": {
                 "log": os.path.basename(self.log_path),
                 "workflow": os.path.basename(self.workflow_copy_path),
@@ -245,6 +309,7 @@ class ExperimentLogger:
         lines.append("## 概要")
         lines.append("")
         lines.append(f"- **ステータス**: {status_label}")
+        lines.append(f"- **実行モード**: {_MODE_LABELS.get(self.mode, self.mode)}")
         lines.append(f"- **開始**: {self.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
         if self.finished_at:
             lines.append(f"- **終了**: {self.finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -260,6 +325,12 @@ class ExperimentLogger:
         lines.append("")
 
         # 時系列イベント（重量・画像をひも付け）
+        if self.recording is not None:
+            owned = self.recording.get("started_by_this_run")
+            lines.append(f"- **センサー録画**: "
+                         + ("このランが開始・終了" if owned else "このランは開始していない（停止もしない）")
+                         + (f"（{self.recording.get('save_dir')}）" if self.recording.get("save_dir") else ""))
+            lines.append("")
         lines.append("## 測定・記録の時系列")
         lines.append("")
         if self.events:

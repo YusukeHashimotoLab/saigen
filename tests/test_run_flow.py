@@ -90,8 +90,10 @@ def test_mock_run_writes_all_artifacts(tmp_path, monkeypatch):
     flow = tmp_path / "short_flow.json"
     flow.write_text(json.dumps({
         "name": "mock artifacts",
-        "description": "tare, dispense, weigh and photograph",
+        "description": "aspirate, tare, dispense, weigh and photograph",
         "steps": [
+            # the mock tracks the held volume like the real wrapper: aspirate first
+            {"action": "aspirate", "robot_id": 1, "volume": 5.0, "speed": 5},
             {"action": "tare_scale", "delay": 0.1},
             {"action": "dispense", "robot_id": 1, "volume": 5.0, "speed": 5},
             {"action": "measure_weight", "stabilization_count": 3},

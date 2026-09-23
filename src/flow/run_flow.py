@@ -156,25 +156,56 @@ def ensure_dashboard_running(timeout: float = 15.0) -> bool:
     return False
 
 
-def start_csv_recording(experiment_name: str) -> Optional[str]:
-    """/api/start を叩いて CSV 録画を開始し、保存ディレクトリを返す。"""
+@dataclass
+class RecordingHandle:
+    """このランが開始した（= 止めてよい）センサー CSV 録画かどうか。
+
+    ``owned`` が True になるのは /api/start が 200 を返したときだけ。409（既に
+    録画中）は「他の誰かの録画」なので、このランは /api/end を送らない。
+    """
+    owned: bool = False
+    save_dir: Optional[str] = None
+    status: int = 0
+
+    def as_metadata(self) -> dict:
+        return {"started_by_this_run": self.owned, "save_dir": self.save_dir,
+                "start_status": self.status}
+
+
+def start_csv_recording(experiment_name: str) -> RecordingHandle:
+    """/api/start を叩いて CSV 録画を開始する。
+
+    Returns:
+        RecordingHandle。200 のときだけ ``owned=True``。409 は既に別の録画が
+        進行中という意味で、保存先は参考として取得するが ``owned=False``。
+    """
     base = _sensor_server_url()
     status, body = _http_post_json(f"{base}/api/start", {"experiment_name": experiment_name})
     if status == 200:
         save_dir = body.get("save_dir")
         logger.info(f"CSV録画開始 (save_dir={save_dir})")
-        return save_dir
+        return RecordingHandle(owned=True, save_dir=save_dir, status=status)
     if status == 409:
-        logger.info("CSV録画開始スキップ: 既に録画中")
+        logger.info("CSV録画開始スキップ: 既に録画中（このランが開始した録画ではないため、"
+                    "終了時にも止めません）")
         try:
-            return _http_get_json(f"{base}/api/status").get("save_dir")
+            save_dir = _http_get_json(f"{base}/api/status").get("save_dir")
         except Exception:
-            return None
+            save_dir = None
+        return RecordingHandle(owned=False, save_dir=save_dir, status=status)
     logger.warning(f"CSV録画開始失敗: {status} {body}")
-    return None
+    return RecordingHandle(owned=False, save_dir=None, status=status)
 
 
-def stop_csv_recording():
+def stop_csv_recording(handle: Optional[RecordingHandle]) -> bool:
+    """このランが開始した録画だけを /api/end で止める。
+
+    Returns:
+        /api/end を送ったら True（``handle`` が None / 他人の録画なら送らず False）
+    """
+    if handle is None or not handle.owned:
+        logger.info("CSV録画終了スキップ: このランが開始した録画ではありません")
+        return False
     status, body = _http_post_json(f"{_sensor_server_url()}/api/end", {})
     if status == 200:
         logger.info(f"CSV録画終了 (saved_path={body.get('saved_path')})")
@@ -182,6 +213,7 @@ def stop_csv_recording():
         logger.info("CSV録画終了スキップ: 録画していません")
     else:
         logger.warning(f"CSV録画終了失敗: {status} {body}")
+    return True
 
 
 # ======================================================================
@@ -325,8 +357,9 @@ def preflight_workspace(steps: list, validator=None) -> PreflightReport:
     return report
 
 
-def log_preflight(report: PreflightReport, validator) -> None:
+def log_preflight(report: PreflightReport, validator, log=None) -> None:
     """プリフライト結果をログに出す（違反は ERROR、相対移動は INFO で要約）"""
+    logger = log or globals()["logger"]
     for i, step, err in report.violations:
         logger.error(f"可動域違反 {_step_label(i, step)} {_fmt_params(step)}\n{err}")
     if report.violations:
@@ -343,6 +376,76 @@ def log_preflight(report: PreflightReport, validator) -> None:
             shown = ", ".join(map(str, idx[:10])) + (" ..." if len(idx) > 10 else "")
             logger.info(f"unverified until run: Robot {rid} {action} {value} "
                         f"（{len(idx)} 回, ステップ {shown}）")
+
+
+#: プリフライトで可動域違反が見つかったときの終了コード（run_flow / run_csv 共通）
+PREFLIGHT_EXIT_CODE = 3
+
+
+class PreflightError(RuntimeError):
+    """プリフライトで可動域違反が見つかった（デバイスは一切開いていない）。
+
+    GUI の FlowRunner などライブラリとして呼ぶ経路はこの例外で中止する。
+    CLI は同じ条件で終了コード ``PREFLIGHT_EXIT_CODE``（3）を返す。
+    """
+
+    def __init__(self, report: "PreflightReport", message: str):
+        super().__init__(message)
+        self.report = report
+
+
+def _unverified_note(report: PreflightReport) -> str:
+    if not report.unverified:
+        return ""
+    return (f"。相対移動 {len(report.unverified)} 件（move_z / rotate_relative / "
+            "move_radial）は開始姿勢に依存するため未検証で、--mock / 実行時に "
+            "1 手ごとに検査されます")
+
+
+def violation_message(report: PreflightReport) -> str:
+    """違反を 1 件 1 行にまとめた、UI / 例外向けの短い文面"""
+    lines = [f"可動域チェックで {len(report.violations)} 件の違反があります。"
+             "デバイスを開かずに中止します:"]
+    for i, step, err in report.violations[:20]:
+        lines.append(f"- {_step_label(i, step)} {_fmt_params(step)}: {err}")
+    if len(report.violations) > 20:
+        lines.append(f"- ...ほか {len(report.violations) - 20} 件")
+    return "\n".join(lines)
+
+
+def run_preflight(steps: list, validator=None, log=None) -> PreflightReport:
+    """デバイスを開く前の可動域プリフライト（検査 + ログ出力）。
+
+    run_flow.py・CSV ランナー（run_csv.py）・GUI（src/gui/runner.py）が共通で
+    使う入口。呼び出し側は ``report.ok`` が False なら何も開かずに中止する
+    （CLI は終了コード 3、ライブラリ経路は :class:`PreflightError`）。
+
+    Args:
+        steps: ループ展開後のステップ dict のリスト
+        validator: 可動域バリデータ（省略時は config.yaml の workspace）
+        log: 出力先ロガー（省略時は run_flow のロガー）
+    """
+    log = log or logger
+    if validator is None:
+        validator = default_workspace_validator()
+    report = preflight_workspace(steps, validator)
+    log_preflight(report, validator, log=log)
+    if not report.ok:
+        log.error(f"可動域チェックで {len(report.violations)} 件の違反があります。"
+                  "デバイスを開かずに中止します（ステップと座標は上記）")
+        return report
+    checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
+                    else "絶対目標（move_xyz / rotate）なし")
+    log.info(f"可動域チェック: {checked_note}{_unverified_note(report)}")
+    return report
+
+
+def require_preflight(steps: list, validator=None, log=None) -> PreflightReport:
+    """:func:`run_preflight` を行い、違反があれば :class:`PreflightError` を送出する"""
+    report = run_preflight(steps, validator, log=log)
+    if not report.ok:
+        raise PreflightError(report, violation_message(report))
+    return report
 
 
 def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
@@ -375,20 +478,10 @@ async def run(args) -> int:
 
     # プリフライト: どのデバイスも開く前に絶対目標を可動域チェックする
     validator = default_workspace_validator()
-    report = preflight_workspace(steps, validator)
-    log_preflight(report, validator)
+    report = run_preflight(steps, validator)
     if not report.ok:
-        logger.error(f"可動域チェックで {len(report.violations)} 件の違反があります。"
-                     "デバイスを開かずに中止します（ステップと座標は上記）")
-        return 3
-    unverified_note = ""
-    if report.unverified:
-        unverified_note = (f"。相対移動 {len(report.unverified)} 件（move_z / rotate_relative / "
-                           "move_radial）は開始姿勢に依存するため未検証で、--mock / 実行時に "
-                           "1 手ごとに検査されます")
-    checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
-                    else "絶対目標（move_xyz / rotate）なし")
-    logger.info(f"可動域チェック: {checked_note}{unverified_note}")
+        return PREFLIGHT_EXIT_CODE
+    unverified_note = _unverified_note(report)
 
     if args.validate_only:
         logger.info(f"検証のみ完了（--validate-only）: スキーマ・ループ構造・絶対目標の可動域 OK"
@@ -409,7 +502,8 @@ async def run(args) -> int:
     # 実行ごとのログフォルダ（run.log / measurements.csv / summary.md /
     # metadata.json / images/ と入力 JSON のコピー）
     exp_logger = ExperimentLogger(
-        workflow.name, workflow.description, args.flow, base_dir=LOGS_DIR
+        workflow.name, workflow.description, args.flow, base_dir=LOGS_DIR,
+        mode="mock" if args.mock else "real",
     )
     exp_logger.record_resources(robot_ids, picus2_robots)
     logger.info(f"実験ログ保存先: {exp_logger.dir}")
@@ -430,9 +524,12 @@ async def run(args) -> int:
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
     video_recorder = None
+    recording = None
     if record:
         if ensure_dashboard_running():
-            save_dir = start_csv_recording(workflow.name) or exp_logger.dir
+            recording = start_csv_recording(workflow.name)
+            exp_logger.record_recording(recording.as_metadata())
+            save_dir = recording.save_dir or exp_logger.dir
             try:
                 from src.monitoring.camera.video_recorder import VideoRecorder
                 video_recorder = VideoRecorder(
@@ -521,9 +618,9 @@ async def run(args) -> int:
                 video_recorder.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"動画録画の停止でエラー: {e}")
-        if record:
+        if recording is not None:
             try:
-                stop_csv_recording()
+                stop_csv_recording(recording)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"CSV録画の停止でエラー: {e}")
         try:

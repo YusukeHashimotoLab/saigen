@@ -45,18 +45,24 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
+
+from pydantic import ValidationError
 
 from src import config as lab_config
 from src.devices.safety.validators import default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import SHARED_DEVICE_ACTIONS, execute_step, expand_loops
 from src.flow.experiment_logger import ExperimentLogger
-from src.flow.experiment_session import ExperimentSession
-from src.flow.run_flow import LOGS_DIR, plan_resources
+from src.flow.experiment_session import ExperimentSession, SafetyAbort
+from src.flow.run_flow import LOGS_DIR, PreflightError, plan_resources, require_preflight
 from src.flow.schema import ExperimentWorkflow
 
 logger = logging.getLogger("gui.runner")
+
+__all__ = ["FlowRunner", "PreflightError", "SafetyAbort", "ProgressEvent",
+           "validate_workflow", "format_validation_error", "check_is_safe",
+           "_safety_gate"]
 
 #: Robots the sidebar offers. Robot 3 is the slider/conveyer arm.
 ROBOT_IDS = (1, 2, 3)
@@ -135,6 +141,93 @@ def format_validation_error(exc: Exception, data: dict = None) -> str:
                 continue
             lines.append(f"- {label} ({action}): {field or '(root)'}: {msg}")
     return "\n".join(lines[:20]) or str(exc)
+
+
+def step_errors(steps) -> Dict[int, str]:
+    """Validate each step on its own; return ``{index: message}`` for the bad ones.
+
+    The canvas renders these steps read-only (no widget may coerce or fill in
+    their values). Loop pairing is not checked here - that is a whole-flow
+    property reported by :func:`validate_workflow`.
+    """
+    errors: Dict[int, str] = {}
+    for i, step in enumerate(steps or []):
+        if not isinstance(step, dict):
+            errors[i] = f"step {i + 1}: not a JSON object"
+            continue
+        try:
+            ExperimentWorkflow(name="step", steps=[step])
+        except ValidationError as e:
+            text = format_validation_error(e, {"steps": [step]})
+            errors[i] = text.replace("step 1", f"step {i + 1}")
+    return errors
+
+
+# ======================================================================
+# Sensor safety gate (dashboard /api/is_safe)
+# ======================================================================
+def _sensor_server_url() -> str:
+    return os.getenv("SENSOR_SERVER_URL", "http://localhost:8000").rstrip("/")
+
+
+def _default_http_get(url: str, timeout: float):
+    import requests  # imported lazily: tests inject http_get instead
+    return requests.get(url, timeout=timeout)
+
+
+def check_is_safe(log_fn=None, *, base_url: Optional[str] = None,
+                  http_get: Optional[Callable] = None, timeout: float = 3.0) -> bool:
+    """Ask the sensor dashboard whether it is safe to run the next step.
+
+    Only a 200 response whose JSON body has ``"safe": true`` (the JSON boolean)
+    counts as safe. ``"safe": "false"``, ``"safe": 1``, a missing key, a non-dict
+    body, an unparsable body or a non-200 status are all *not safe*
+    (``bool("false")`` is truthy, so the value is compared with ``is True``).
+
+    The dashboard is optional: if it cannot be reached at all (connection
+    refused / timeout, i.e. no HTTP response) the gate lets the step through,
+    as before. ``log_fn`` receives a warning for every refusal.
+    """
+    log_fn = log_fn or logging.getLogger("gui.safety").warning
+    url = f"{base_url or _sensor_server_url()}/api/is_safe"
+    get = http_get or _default_http_get
+    try:
+        resp = get(url, timeout=timeout)
+    except OSError:
+        # requests.RequestException (connection refused, timeout) derives from
+        # OSError: no dashboard -> the optional gate is skipped. Any other
+        # exception (a bug) propagates and aborts the run.
+        return True
+
+    status = getattr(resp, "status_code", None)
+    if status != 200:
+        log_fn(f"安全確認失敗: HTTP {status} {getattr(resp, 'text', '')}")
+        return False
+    try:
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        log_fn(f"安全確認失敗: 応答を JSON として読めません: {e}")
+        return False
+    safe = body.get("safe") if isinstance(body, dict) else None
+    if safe is True:
+        return True
+    log_fn(f"⚠️ 安全確認 NG（safe={safe!r}）: 異常検知のため中断します")
+    return False
+
+
+def _safety_gate(step: dict, *, check: Optional[Callable[..., bool]] = None):
+    """``pre_step`` gate for real runs: raise :class:`SafetyAbort` when not safe.
+
+    ``SafetyAbort`` (from ``src.flow.experiment_session``) makes the session
+    stop the hardware in place without a go-home move, which may itself be the
+    unsafe action. Runs on the runner thread, so no Streamlit calls here.
+    """
+    is_safe = (check or check_is_safe)(log_fn=logging.getLogger("gui.safety").warning)
+    if is_safe is not True:
+        raise SafetyAbort(
+            f"安全確認 NG（センサーダッシュボードが異常を検知）により中断: "
+            f"{step.get('action') if isinstance(step, dict) else step}"
+        )
 
 
 # ======================================================================
@@ -262,7 +355,11 @@ class FlowRunner:
         source_path: path of the JSON the flow came from, copied into the run
             folder. When omitted the dict is written to a temporary file.
         pre_step: optional callable invoked before every step; raising aborts
-            the run (the GUI uses it for the dashboard's ``/api/is_safe`` gate).
+            the run (the GUI uses :func:`_safety_gate`, which raises
+            :class:`SafetyAbort`, for the dashboard's ``/api/is_safe`` gate).
+        recording: optional dict describing the sensor recording the GUI
+            started for this run (``started_by_this_run`` etc.), written to
+            ``metadata.json``.
         robot_factory / shared_factory: ExperimentSession factory overrides (tests).
     """
 
@@ -280,10 +377,17 @@ class FlowRunner:
         pre_step: Optional[Callable[[dict], None]] = None,
         robot_factory: Optional[Callable] = None,
         shared_factory: Optional[Callable] = None,
+        recording: Optional[dict] = None,
     ):
         # Validation happens here: an invalid flow raises before anything is
         # built, so no ExperimentSession and no run folder are ever created.
         self.workflow, self.steps = validate_workflow(workflow_data)
+        # Workspace preflight, same as the CLI (run_flow / run_csv): absolute
+        # targets are checked before any device is opened; a violation raises
+        # PreflightError here, before a session or run folder exists.
+        self.validator = default_workspace_validator()
+        self.preflight = require_preflight(self.steps, self.validator, log=logger)
+        self.recording = recording
 
         self.workflow_data = workflow_data
         self.mock = mock
@@ -437,8 +541,11 @@ class FlowRunner:
             self.workflow.description,
             self._source_json_path(),
             base_dir=self.logs_dir,
+            mode="mock" if self.mock else "real",
         )
         exp_logger.record_resources(robot_ids, picus2_robots)
+        if self.recording is not None:
+            exp_logger.record_recording(self.recording)
         self.log_dir = exp_logger.dir
 
         accuracy_logger = DispenseAccuracyLogger(
@@ -470,7 +577,7 @@ class FlowRunner:
             shared_factory=self.shared_factory,
             robot_ports=self.robot_ports,
             shared_config=self.shared_config,
-            workspace_validator=default_workspace_validator(),
+            workspace_validator=self.validator,
         )
         with self._lock:
             self.session = session

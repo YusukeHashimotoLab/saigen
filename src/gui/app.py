@@ -34,6 +34,7 @@ except ImportError:
 from pydantic import ValidationError
 
 from src.flow.executor import SHARED_DEVICE_ACTIONS
+from src.flow.schema import PIPETTE_MIN_VOLUME_ML
 
 # 実行ロジックは Streamlit 非依存の runner.py に集約している（CLI と同じ経路:
 # スキーマ検証 → ループ展開 → ExperimentSession → ExperimentLogger）。
@@ -202,8 +203,15 @@ if "robot_configs" not in st.session_state or "shared_config" not in st.session_
     st.session_state.robot_configs = _device_defaults["robots"]
     st.session_state.shared_config = _device_defaults["shared"]
 
-if "use_mock" not in st.session_state:
-    st.session_state.use_mock = False  # Mockはデフォルトオフ
+# 実行モード: 既定は Mock。実機で動かすには実行パネルの「実機で実行する」を
+# このセッション内で毎回チェックし、さらに確認ダイアログで承認する必要がある。
+# 実機ランを開始するとチェックは自動で外れる（次の実機ランでは再度チェックが要る）。
+if "arm_real_run" not in st.session_state:
+    st.session_state.arm_real_run = False
+if "flow_rev" not in st.session_state:
+    st.session_state.flow_rev = 0        # ウィジェットキーに含めるフローの版番号
+if "rejected_flow" not in st.session_state:
+    st.session_state.rejected_flow = None  # 検証に通らず読み込まなかったフロー（読み取り専用表示）
 
 
 def generate_loop_id():
@@ -214,6 +222,9 @@ def generate_loop_id():
 
 def add_step(action_type):
     """新しいブロックを追加"""
+    if is_running():
+        return
+    _bump_flow_rev()
     config = ACTION_CONFIG.get(action_type, {})
     new_step = {"action": action_type, **config.get("defaults", {})}
 
@@ -240,6 +251,9 @@ def add_step(action_type):
 
 def remove_step(index):
     """ステップを削除（ループの場合はペアで削除）"""
+    if is_running():
+        return
+    _bump_flow_rev()
     steps = st.session_state.workflow_data["steps"]
     step = steps[index]
     action = step.get("action")
@@ -260,6 +274,9 @@ def remove_step(index):
 
 
 def move_step(index, direction):
+    if is_running():
+        return
+    _bump_flow_rev()
     steps = st.session_state.workflow_data["steps"]
     new_index = index + direction
     if 0 <= new_index < len(steps):
@@ -278,7 +295,13 @@ def _update_robot_id(idx, key):
 
 
 def _update_step_param(idx, param_name, widget_key):
-    """ウィジェットの値変更時にstepデータを即時更新するコールバック"""
+    """ウィジェットの値変更時にstepデータを即時更新するコールバック
+
+    フローへの書き込みはこのコールバック（= ユーザーが値を変えたとき）だけで行う。
+    実行中は書き換えない。
+    """
+    if is_running():
+        return
     st.session_state.workflow_data["steps"][idx][param_name] = st.session_state[widget_key]
 
 
@@ -316,46 +339,36 @@ def is_running() -> bool:
 # ==========================================
 # 6. ワークフロー実行（runner.py に委譲）
 # ==========================================
-def check_is_safe(log_fn=None) -> bool:
-    """各ステップ実行前の安全確認 (sensor_web_dashboard /api/is_safe)
+def start_experiment_session(name: str, description: str = None) -> dict:
+    """センサーサーバーに実験開始を通知 (sensor_web_dashboard /api/start)
 
-    将来 Pi のセンサー値による異常検知をサーバ側で実装予定。
-    成功時は無音、NG・HTTP エラーのみ log_fn で警告。
-    センサーサーバ未起動時はゲートを通す（オプション扱い）。
+    200 のときだけ「このランが開始した録画」として記録し、終了時に /api/end を送る。
+    409（既に録画中）は他の誰かの録画なので、止めない。
+
+    Returns:
+        metadata.json に残す録画情報（``started_by_this_run`` など）
     """
-    if log_fn is None:
-        log_fn = add_log
-    try:
-        resp = requests.get(f"{SENSOR_SERVER_URL}/api/is_safe", timeout=3)
-        if resp.status_code == 200:
-            safe = bool(resp.json().get("safe", False))
-            if not safe:
-                log_fn("⚠️ 安全確認 NG: 異常検知のため中断します")
-            return safe
-        log_fn(f"安全確認失敗: {resp.status_code} {resp.text}")
-        return False
-    except requests.RequestException:
-        return True
-
-
-def start_experiment_session(name: str, description: str = None):
-    """センサーサーバーに実験開始を通知 (sensor_web_dashboard /api/start)"""
+    st.session_state.experiment_recording = False
+    info = {"started_by_this_run": False, "save_dir": None, "start_status": 0}
     try:
         resp = requests.post(
             f"{SENSOR_SERVER_URL}/api/start",
             json={"experiment_name": name},
             timeout=3,
         )
+        info["start_status"] = resp.status_code
         if resp.status_code == 200:
             data = resp.json()
             st.session_state.experiment_recording = True
+            info.update(started_by_this_run=True, save_dir=data.get("save_dir"))
             add_log(f"センサー録画開始 (save_dir={data.get('save_dir')})")
         elif resp.status_code == 409:
-            add_log("センサー録画開始スキップ: 既に録画中")
+            add_log("センサー録画開始スキップ: 既に録画中（このランの録画ではないので終了時も止めません）")
         else:
             add_log(f"センサー録画開始失敗: {resp.status_code} {resp.text}")
     except requests.RequestException:
         pass
+    return info
 
 
 def stop_experiment_session():
@@ -388,65 +401,76 @@ def build_run_settings() -> dict:
     }
 
 
-def _safety_gate(step: dict):
-    """各ステップ実行前の安全確認。NG なら例外を投げて実行を止める。
+def set_workflow(data, source: str = "生成結果") -> bool:
+    """LLM・プリセット・JSON読込のフローを、検証に通った場合だけキャンバスに載せる
 
-    runner のバックグラウンドスレッドから呼ばれるため、Streamlit の API は
-    触らない（ログは logging 経由で UI とrun.log の両方に流れる）。
+    検証に失敗したフローは読み込まず（今のフローはそのまま）、読み取り専用で
+    エラーと一緒に表示する。実行中は差し替えない。
+
+    Returns:
+        読み込んだら True
     """
-    if not check_is_safe(log_fn=logging.getLogger("gui.safety").warning):
-        raise RuntimeError("安全確認 NG（センサーダッシュボードが異常を検知）により中断")
-
-
-def set_workflow(data: dict, source: str = "生成結果"):
-    """LLM・プリセット・JSON読込のフローをキャンバスに載せる（同時に検証する）
-
-    キャンバスは未指定パラメータを既定値で埋めてしまうため、外から来た
-    フローは *埋める前に* 検証して、問題があればその場で知らせる。
-    実行前の検証（start_run）と合わせて二段構えにしている。
-    """
-    st.session_state.workflow_data = data
+    if is_running():
+        st.session_state.error_message = "実行中はフローを差し替えられません（停止または完了後に読み込んでください）"
+        return False
     try:
+        if not isinstance(data, dict):
+            raise TypeError("フローは JSON オブジェクトである必要があります")
         flow_runner.validate_workflow(data)
     except ValidationError as e:
-        st.session_state.error_message = (
-            f"{source}のスキーマ検証に失敗しました。実行前に修正してください:\n\n"
-            + flow_runner.format_validation_error(e, st.session_state.workflow_data)
-        )
+        message = (f"{source}はスキーマ検証に失敗したため読み込みませんでした"
+                   "（今のフローはそのままです）:\n\n"
+                   + flow_runner.format_validation_error(e, data if isinstance(data, dict) else None))
     except (ValueError, TypeError) as e:
-        st.session_state.error_message = f"{source}のフロー定義エラー: {e}"
+        message = f"{source}のフロー定義エラーのため読み込みませんでした（今のフローはそのままです）: {e}"
     else:
+        st.session_state.workflow_data = data
+        st.session_state.rejected_flow = None
         st.session_state.error_message = None
+        _bump_flow_rev()
+        return True
+    st.session_state.rejected_flow = {"source": source, "data": data, "error": message}
+    st.session_state.error_message = message
+    return False
 
 
 def validate_current_workflow():
-    """実行せずにスキーマ検証とループ展開だけ行う"""
+    """実行せずにスキーマ検証・ループ展開・可動域プリフライトだけ行う"""
     try:
         _, steps = flow_runner.validate_workflow(st.session_state.workflow_data)
+        report = flow_runner.require_preflight(steps)
     except ValidationError as e:
         st.session_state.error_message = (
             "JSON スキーマ検証に失敗しました:\n\n"
             + flow_runner.format_validation_error(e, st.session_state.workflow_data)
         )
+    except flow_runner.PreflightError as e:
+        st.session_state.error_message = f"可動域プリフライトで違反が見つかりました:\n\n{e}"
     except (ValueError, TypeError) as e:
         st.session_state.error_message = f"フロー定義エラー: {e}"
     else:
         st.session_state.error_message = None
-        st.toast(f"検証OK: {len(steps)} ステップ（ループ展開後）", icon="✅")
+        note = (f"、相対移動 {len(report.unverified)} 件は実行時に検査"
+                if report.unverified else "")
+        st.toast(f"検証OK: {len(steps)} ステップ（ループ展開後）{note}", icon="✅")
 
 
-def start_run():
-    """検証してから FlowRunner を起動する（実行はバックグラウンドスレッド1本）
+def start_run(mock: bool = True):
+    """検証・プリフライトしてから FlowRunner を起動する（実行はバックグラウンドスレッド1本）
 
-    検証に失敗したフローはここで弾かれ、ロボットには一切触れない。
+    検証または可動域プリフライトに失敗したフローはここで弾かれ、ロボットには
+    一切触れない。``mock=False``（実機）は、実行パネルで「実機で実行する」を
+    チェックし確認ダイアログで承認したときだけ渡される。
     """
+    if is_running():
+        return
     st.session_state.log_messages = []
     st.session_state.error_message = None
     st.session_state.run_status = None
     st.session_state.run_log_dir = None
     st.session_state.run_progress = (0, 0)
 
-    use_mock = st.session_state.use_mock
+    use_mock = bool(mock)
     robot_ports, shared_config = flow_runner.settings_to_session_args(build_run_settings())
 
     try:
@@ -456,13 +480,16 @@ def start_run():
             robot_ports=robot_ports,
             shared_config=shared_config,
             # Mock 実行では録画も安全確認ゲートも使わない（CLI の --mock と同じ）
-            pre_step=None if use_mock else _safety_gate,
+            pre_step=None if use_mock else flow_runner._safety_gate,
         )
     except ValidationError as e:
         st.session_state.error_message = (
             "JSON スキーマ検証に失敗しました。実行は行いません:\n\n"
             + flow_runner.format_validation_error(e, st.session_state.workflow_data)
         )
+        return
+    except flow_runner.PreflightError as e:
+        st.session_state.error_message = f"可動域プリフライトで違反が見つかりました。実行は行いません:\n\n{e}"
         return
     except (ValueError, TypeError) as e:
         st.session_state.error_message = f"フロー定義エラー。実行は行いません: {e}"
@@ -473,7 +500,7 @@ def start_run():
     add_log(f"✓ 検証OK: {len(runner.steps)} ステップ（ループ展開後）")
 
     if not use_mock:
-        start_experiment_session(
+        runner.recording = start_experiment_session(
             name=runner.workflow.name, description=runner.workflow.description
         )
 
@@ -520,9 +547,37 @@ def drain_runner_events():
     st.session_state.run_progress = (done, total)
 
 
+@st.dialog("実機で実行しますか？")
+def confirm_real_run_dialog():
+    """実機ランの最終確認。ここで「実機で開始」を押したときだけ mock=False で起動する"""
+    data = st.session_state.workflow_data
+    st.warning("⚠️ ロボットアームが動き、液体が分注されます。"
+               "可動域に人や物がないこと、緊急時は ■ 停止 で止まることを確認してください。")
+    st.markdown(f"**フロー**: {escape(str(data.get('name', '')))}　／　"
+                f"**ステップ数**: {len(data.get('steps') or [])}（ループ展開前）")
+    ports = flow_runner.settings_to_session_args(build_run_settings())[0]
+    st.caption("接続ポート: " + ", ".join(
+        f"Robot {rid}: {cfg.get('dobot_port') or '-'}" for rid, cfg in ports.items()))
+    c1, c2 = st.columns(2)
+    if c1.button("実機で開始", type="primary", use_container_width=True, key="confirm_real_run"):
+        st.session_state["_disarm_real_run"] = True
+        start_run(mock=False)
+        st.rerun()
+    if c2.button("キャンセル", use_container_width=True, key="cancel_real_run"):
+        st.rerun()
+
+
 def render_execution_panel():
-    """実行パネル（停止 / 検証 / 実行）"""
+    """実行パネル（停止 / 検証 / 実行）。キャンバスより先に描画する
+
+    キャンバスの描画で例外が出ても停止ボタンが消えないよう、メイン領域の
+    最初に置く。
+    """
     running = is_running()
+    # 実機ランを開始したら「実機で実行する」を外す（ウィジェット生成前にだけ変更できる）
+    if st.session_state.pop("_disarm_real_run", False):
+        st.session_state.arm_real_run = False
+
     st.markdown('<div class="execution-panel">', unsafe_allow_html=True)
 
     col_stop, col_validate, col_run = st.columns([1, 1, 2])
@@ -535,12 +590,25 @@ def render_execution_panel():
     with col_validate:
         validate_clicked = st.button(
             "✔ 検証", use_container_width=True, disabled=running,
-            help="実行せずにスキーマ検証とループ展開だけ行います",
+            help="実行せずにスキーマ検証・ループ展開・可動域プリフライトだけ行います",
         )
     with col_run:
+        armed = bool(st.session_state.get("arm_real_run"))
         run_clicked = st.button(
-            "▶ 実行", type="primary", use_container_width=True, disabled=running
+            "▶ 実機で実行" if armed else "▶ 実行（Mock）",
+            type="primary", use_container_width=True, disabled=running,
         )
+
+    st.checkbox(
+        "実機で実行する", key="arm_real_run", disabled=running,
+        help="チェックしない限り Mock（実機に触れない）で実行します。"
+             "チェックした場合も確認ダイアログで承認するまで実機は動きません。"
+             "実機ランを開始するとチェックは外れます。",
+    )
+    if st.session_state.get("arm_real_run"):
+        st.warning("⚠️ 実機モード: ▶ で確認ダイアログが開き、承認するとロボットが動きます")
+    else:
+        st.caption("🛠 Mock モード（既定）: 実機には触れません（録画・安全確認ゲートなし）")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -554,18 +622,21 @@ def render_execution_panel():
     if st.session_state.run_log_dir:
         st.caption(f"📁 {st.session_state.run_log_dir}")
 
-    if validate_clicked:
-        validate_current_workflow()
-        st.rerun()
-
-    if run_clicked:
-        start_run()
-        st.rerun()
-
     if stop_clicked and st.session_state.runner is not None:
         st.session_state.runner.request_stop()
         add_log("🛑 停止を要求しました（緊急停止 → 後始末）")
         st.rerun()
+
+    if validate_clicked:
+        validate_current_workflow()
+        st.rerun()
+
+    if run_clicked and not running:
+        if armed:
+            confirm_real_run_dialog()
+        else:
+            start_run(mock=True)
+            st.rerun()
 
 
 def render_toolbox():
@@ -577,7 +648,8 @@ def render_toolbox():
             for action in actions:
                 config = ACTION_CONFIG[action]
                 btn_label = f"{config['icon']} {config['label']}"
-                if st.button(btn_label, key=f"add_{action}", use_container_width=True):
+                if st.button(btn_label, key=f"add_{action}", use_container_width=True,
+                             disabled=is_running()):
                     add_step(action)
                     st.rerun()
 
@@ -640,20 +712,28 @@ def ai_workflow_dialog():
         key="dialog_prompt"
     )
 
+    running = is_running()
     btn_col, mic_col = st.columns([5, 1], vertical_alignment="bottom")
-    generate_clicked = btn_col.button("生成実行", type="primary", use_container_width=True)
+    generate_clicked = btn_col.button("生成実行", type="primary", use_container_width=True,
+                                      disabled=running)
     with mic_col:
         render_voice_input("dialog")
+    if running:
+        st.info("実行中は新しいフローを生成・読み込みできません")
 
-    if generate_clicked:
+    if generate_clicked and not running:
         if ai_prompt.strip():
             with st.spinner("生成中..."):
                 try:
                     result = generate_workflow_from_prompt(ai_prompt)
-                    set_workflow(result, "AI生成")
-                    st.rerun()
                 except Exception as e:
-                    st.error(f"エラー: {e}")
+                    # 失敗時は何も読み込まず、入力した指示はそのまま残す
+                    st.error(f"生成に失敗しました（フローは変更していません）: {e}")
+                else:
+                    if set_workflow(result, "AI生成"):
+                        st.rerun()
+                    else:
+                        st.error(st.session_state.error_message)
         else:
             st.warning("指示を入力してください")
 
@@ -716,148 +796,149 @@ def get_param_summary(step):
     return ""
 
 
+def _wkey(name, idx):
+    """ウィジェットのキー。フローの版番号を含めるので、フローを差し替えたり
+    ステップを並べ替えたりすると、前のフローのウィジェット値は使われない。"""
+    return f"{name}_{st.session_state.get('flow_rev', 0)}_{idx}"
+
+
+def _bump_flow_rev():
+    st.session_state.flow_rev = st.session_state.get("flow_rev", 0) + 1
+
+
+def _num(container, label, step, idx, param, kind, default, **kwargs):
+    """数値入力。表示値だけ既定値で補い、保存済みフローには書き込まない
+    （書き込むのはユーザーが値を変えたときの on_change だけ）。"""
+    key = _wkey(param, idx)
+    raw = step.get(param)
+    value = kind(default if raw is None else raw)
+    container.number_input(label, value=value, key=key,
+                           on_change=_update_step_param, args=(idx, param, key), **kwargs)
+
+
+def _select(container, label, step, idx, param, options, default, **kwargs):
+    key = _wkey(param, idx)
+    current = step.get(param, default)
+    index = options.index(current) if current in options else options.index(default)
+    container.selectbox(label, options=options, index=index, key=key,
+                        on_change=_update_step_param, args=(idx, param, key), **kwargs)
+
+
+def _check(container, label, step, idx, param, default):
+    key = _wkey(param, idx)
+    raw = step.get(param)
+    container.checkbox(label, value=(default if raw is None else raw is True), key=key,
+                       on_change=_update_step_param, args=(idx, param, key))
+
+
+def _text(container, label, step, idx, param):
+    key = _wkey(param, idx)
+    container.text_input(label, value=step.get(param) or "", key=key,
+                         on_change=_update_step_param, args=(idx, param, key))
+
+
+def _toggle_led_level(idx, key):
+    """「明るさも設定する」の on_change: チェック時だけ level を書き込む"""
+    step = st.session_state.workflow_data["steps"][idx]
+    if st.session_state[key]:
+        if step.get("level") is None:
+            step["level"] = 12
+    else:
+        step.pop("level", None)
+
+
 def render_step_params(step, idx):
-    """ステップのパラメータ入力UI（popover内用）"""
+    """ステップのパラメータ入力UI（popover内用）
+
+    描画だけではフローを書き換えない: 各ウィジェットは on_change でのみ
+    ``workflow_data`` を更新する。検証に通らないステップは呼び出し側で
+    読み取り専用表示にしている（ここには来ない）。
+    """
     action = step["action"]
 
     if action == "move_xyz":
         c1, c2, c3 = st.columns(3)
-        step["x"] = c1.number_input("X", value=float(step.get("x", 0)), key=f"x_{idx}", label_visibility="collapsed",
-                                    on_change=_update_step_param, args=(idx, "x", f"x_{idx}"))
-        step["y"] = c2.number_input("Y", value=float(step.get("y", 0)), key=f"y_{idx}", label_visibility="collapsed",
-                                    on_change=_update_step_param, args=(idx, "y", f"y_{idx}"))
-        step["z"] = c3.number_input("Z", value=float(step.get("z", 0)), key=f"z_{idx}", label_visibility="collapsed",
-                                    on_change=_update_step_param, args=(idx, "z", f"z_{idx}"))
+        _num(c1, "X", step, idx, "x", float, 0.0, label_visibility="collapsed")
+        _num(c2, "Y", step, idx, "y", float, 0.0, label_visibility="collapsed")
+        _num(c3, "Z", step, idx, "z", float, 0.0, label_visibility="collapsed")
         st.caption("X / Y / Z (mm)")
 
     elif action == "move_z":
-        step["distance"] = st.number_input("距離 (mm)", value=float(step.get("distance", 0)), key=f"dist_{idx}",
-                                           on_change=_update_step_param, args=(idx, "distance", f"dist_{idx}"))
+        _num(st, "距離 (mm)", step, idx, "distance", float, 0.0)
 
     elif action == "move_radial":
-        step["distance"] = st.number_input("半径距離 (mm)  正=外向き / 負=内向き", value=float(step.get("distance", 20.0)),
-                                           key=f"rad_{idx}",
-                                           on_change=_update_step_param, args=(idx, "distance", f"rad_{idx}"))
+        _num(st, "半径距離 (mm)  正=外向き / 負=内向き", step, idx, "distance", float, 20.0)
 
     elif action in ["rotate", "rotate_relative"]:
         label = "角度 (deg)" + (" - 相対" if action == "rotate_relative" else " - 絶対")
         c1, c2 = st.columns(2)
-        step["angle"] = c1.number_input(label, value=float(step.get("angle", 0)), key=f"ang_{idx}",
-                                        on_change=_update_step_param, args=(idx, "angle", f"ang_{idx}"))
-        speed_options = ["low", "normal", "high"]
+        _num(c1, label, step, idx, "angle", float, 0.0)
         speed_labels = {"low": "低速", "normal": "普通", "high": "高速"}
-        current_speed = step.get("speed", "low")
-        current_index = speed_options.index(current_speed) if current_speed in speed_options else 0
-        step["speed"] = c2.selectbox("速度", options=speed_options, index=current_index,
-                                     format_func=lambda x: speed_labels[x], key=f"rot_spd_{idx}",
-                                     on_change=_update_step_param, args=(idx, "speed", f"rot_spd_{idx}"))
+        _select(c2, "速度", step, idx, "speed", ["low", "normal", "high"], "low",
+                format_func=lambda x: speed_labels[x])
 
     elif action == "move_slider":
-        step["position"] = st.number_input("位置 (mm)", value=float(step.get("position", 500.0)),
-                                           min_value=0.0, max_value=1000.0, step=10.0, key=f"slider_pos_{idx}",
-                                           on_change=_update_step_param, args=(idx, "position", f"slider_pos_{idx}"))
+        _num(st, "位置 (mm)", step, idx, "position", float, 500.0,
+             min_value=0.0, max_value=1000.0, step=10.0)
 
     elif action == "move_conveyer":
         c1, c2, c3 = st.columns(3)
-        step["index"] = c1.number_input("Index", value=int(step.get("index", 0)),
-                                        min_value=0, max_value=1, key=f"conv_idx_{idx}",
-                                        on_change=_update_step_param, args=(idx, "index", f"conv_idx_{idx}"))
-        step["speed"] = c2.number_input("速度 (mm/s)", value=float(step.get("speed", 10.0)),
-                                        min_value=0.1, max_value=200.0, step=1.0, key=f"conv_spd_{idx}",
-                                        on_change=_update_step_param, args=(idx, "speed", f"conv_spd_{idx}"))
-        step["duration"] = c3.number_input("時間 (秒)", value=float(step.get("duration", 5.0)),
-                                           min_value=0.1, max_value=300.0, step=1.0, key=f"conv_dur_{idx}",
-                                           on_change=_update_step_param, args=(idx, "duration", f"conv_dur_{idx}"))
+        _num(c1, "Index", step, idx, "index", int, 0, min_value=0, max_value=1)
+        _num(c2, "速度 (mm/s)", step, idx, "speed", float, 10.0,
+             min_value=0.1, max_value=200.0, step=1.0)
+        _num(c3, "時間 (秒)", step, idx, "duration", float, 5.0,
+             min_value=0.1, max_value=300.0, step=1.0)
 
     elif action == "wait":
-        step["seconds"] = st.number_input("秒数", value=float(step.get("seconds", 1)), min_value=0.1, key=f"sec_{idx}",
-                                          on_change=_update_step_param, args=(idx, "seconds", f"sec_{idx}"))
+        _num(st, "秒数", step, idx, "seconds", float, 1.0, min_value=0.1)
 
-    elif action == "aspirate":
+    elif action in ("aspirate", "dispense"):
         c1, c2 = st.columns(2)
-        step["volume"] = c1.number_input("容量 (mL)", value=float(step.get("volume", 5.0)),
-                                         min_value=0.1, max_value=10.0, step=0.1, key=f"asp_vol_{idx}",
-                                         on_change=_update_step_param, args=(idx, "volume", f"asp_vol_{idx}"))
-        step["speed"] = c2.number_input("速度", value=int(step.get("speed", 5)),
-                                        min_value=1, max_value=9, key=f"asp_spd_{idx}",
-                                        on_change=_update_step_param, args=(idx, "speed", f"asp_spd_{idx}"))
-
-    elif action == "dispense":
-        c1, c2 = st.columns(2)
-        step["volume"] = c1.number_input("容量 (mL)", value=float(step.get("volume", 5.0)),
-                                         min_value=0.1, max_value=10.0, step=0.1, key=f"dis_vol_{idx}",
-                                         on_change=_update_step_param, args=(idx, "volume", f"dis_vol_{idx}"))
-        step["speed"] = c2.number_input("速度", value=int(step.get("speed", 5)),
-                                        min_value=1, max_value=9, key=f"dis_spd_{idx}",
-                                        on_change=_update_step_param, args=(idx, "speed", f"dis_spd_{idx}"))
+        _num(c1, "容量 (mL)", step, idx, "volume", float, PIPETTE_MIN_VOLUME_ML,
+             min_value=PIPETTE_MIN_VOLUME_ML, max_value=10.0, step=0.1)
+        _num(c2, "速度", step, idx, "speed", int, 5, min_value=1, max_value=9)
 
     elif action == "blow_out":
         c1, c2, c3 = st.columns(3)
-        step["go_home"] = c1.checkbox("ホーム", value=bool(step.get("go_home", True)), key=f"bo_home_{idx}",
-                                      on_change=_update_step_param, args=(idx, "go_home", f"bo_home_{idx}"))
-        step["speed"] = c2.number_input("速度", value=int(step.get("speed", 1)),
-                                        min_value=1, max_value=9, key=f"bo_spd_{idx}",
-                                        on_change=_update_step_param, args=(idx, "speed", f"bo_spd_{idx}"))
-        step["delay_ms"] = c3.number_input("遅延(ms)", value=int(step.get("delay_ms", 3000)),
-                                           min_value=0, max_value=10000, step=100, key=f"bo_delay_{idx}",
-                                           on_change=_update_step_param, args=(idx, "delay_ms", f"bo_delay_{idx}"))
+        _check(c1, "ホーム", step, idx, "go_home", True)
+        _num(c2, "速度", step, idx, "speed", int, 1, min_value=1, max_value=9)
+        _num(c3, "遅延(ms)", step, idx, "delay_ms", int, 3000,
+             min_value=0, max_value=10000, step=100)
 
-    elif action == "capture_and_save":
-        step["file_path"] = st.text_input("ファイルパス", value=str(step.get("file_path", "")), key=f"cap_path_{idx}",
-                                          on_change=_update_step_param, args=(idx, "file_path", f"cap_path_{idx}"))
-
-    elif action == "capture_microscope":
-        step["file_path"] = st.text_input("ファイルパス", value=str(step.get("file_path", "")), key=f"micro_path_{idx}",
-                                          on_change=_update_step_param, args=(idx, "file_path", f"micro_path_{idx}"))
+    elif action in ("capture_and_save", "capture_microscope"):
+        _text(st, "ファイルパス（空欄で実験フォルダに自動保存）", step, idx, "file_path")
 
     elif action == "microscope_led":
-        step["on"] = st.checkbox("点灯する", value=bool(step.get("on", True)), key=f"mled_on_{idx}",
-                                 on_change=_update_step_param, args=(idx, "on", f"mled_on_{idx}"))
-        set_level = st.checkbox("明るさも設定する", value=step.get("level") is not None, key=f"mled_setlv_{idx}")
-        if set_level:
-            step["level"] = st.number_input("明るさ (0-255、出荷時 12)", value=int(12 if step.get("level") is None else step.get("level")),
-                                            min_value=0, max_value=255, key=f"mled_lv_{idx}",
-                                            on_change=_update_step_param, args=(idx, "level", f"mled_lv_{idx}"))
-        else:
-            step["level"] = None
+        _check(st, "点灯する", step, idx, "on", True)
+        lv_key = _wkey("set_level", idx)
+        set_level = st.checkbox("明るさも設定する", value=step.get("level") is not None,
+                                key=lv_key, on_change=_toggle_led_level, args=(idx, lv_key))
+        if set_level and step.get("level") is not None:
+            _num(st, "明るさ (0-255、出荷時 12)", step, idx, "level", int, 12,
+                 min_value=0, max_value=255)
 
     elif action == "microscope_focus":
-        modes = ["auto", "position", "step"]
-        step["mode"] = st.selectbox("モード", modes, index=modes.index(step.get("mode", "auto")), key=f"mf_mode_{idx}",
-                                    on_change=_update_step_param, args=(idx, "mode", f"mf_mode_{idx}"))
-        if step["mode"] == "position":
-            step["position"] = st.number_input("レンズ位置 (0-65535)", value=int(1568 if step.get("position") is None else step.get("position")),
-                                               min_value=0, max_value=65535, key=f"mf_pos_{idx}",
-                                               on_change=_update_step_param, args=(idx, "position", f"mf_pos_{idx}"))
-        elif step["mode"] == "step":
-            dirs = ["in", "out"]
-            step["direction"] = st.selectbox("方向", dirs, index=dirs.index(step.get("direction", "in")), key=f"mf_dir_{idx}",
-                                             on_change=_update_step_param, args=(idx, "direction", f"mf_dir_{idx}"))
-            step["steps"] = st.number_input("回数", value=int(step.get("steps", 1)), min_value=1, max_value=100, key=f"mf_steps_{idx}",
-                                            on_change=_update_step_param, args=(idx, "steps", f"mf_steps_{idx}"))
-        step["timeout"] = st.number_input("待機上限(秒)", value=float(step.get("timeout", 60.0)), min_value=1.0, max_value=300.0,
-                                          step=5.0, key=f"mf_to_{idx}",
-                                          on_change=_update_step_param, args=(idx, "timeout", f"mf_to_{idx}"))
+        _select(st, "モード", step, idx, "mode", ["auto", "position", "step"], "auto")
+        mode = step.get("mode", "auto")
+        if mode == "position":
+            _num(st, "レンズ位置 (0-65535)", step, idx, "position", int, 1568,
+                 min_value=0, max_value=65535)
+        elif mode == "step":
+            _select(st, "方向", step, idx, "direction", ["in", "out"], "in")
+            _num(st, "回数", step, idx, "steps", int, 1, min_value=1, max_value=100)
+        _num(st, "待機上限(秒)", step, idx, "timeout", float, 60.0,
+             min_value=1.0, max_value=300.0, step=5.0)
 
     elif action == "measure_weight":
-        step["stabilization_count"] = st.number_input("測定回数", value=int(step.get("stabilization_count", 3)),
-                                                      min_value=1, max_value=10, key=f"mw_count_{idx}",
-                                                      on_change=_update_step_param, args=(idx, "stabilization_count", f"mw_count_{idx}"))
+        _num(st, "測定回数", step, idx, "stabilization_count", int, 3,
+             min_value=1, max_value=10)
 
     elif action == "tare_scale":
-        step["delay"] = st.number_input("待機時間(秒)", value=float(step.get("delay", 1.0)),
-                                        min_value=0.1, max_value=10.0, step=0.1, key=f"tare_delay_{idx}",
-                                        on_change=_update_step_param, args=(idx, "delay", f"tare_delay_{idx}"))
+        _num(st, "待機時間(秒)", step, idx, "delay", float, 1.0,
+             min_value=0.1, max_value=10.0, step=0.1)
 
     elif action == "loop_start":
-        step["count"] = st.number_input(
-            "繰り返し回数",
-            value=int(step.get("count", 10)),
-            min_value=1,
-            max_value=1000,
-            key=f"loop_count_{idx}",
-            on_change=_update_step_param, args=(idx, "count", f"loop_count_{idx}")
-        )
+        _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)
         st.caption(f"ループID: {step.get('loop_id', '')}")
 
     elif action == "loop_end":
@@ -865,10 +946,15 @@ def render_step_params(step, idx):
         st.info("対応する「ループ開始」と連動します")
 
 
-def render_step_card(step, idx, total):
-    """ステップカードを描画（シンプル版：カード + メニューpopover）"""
-    action = step["action"]
-    config = ACTION_CONFIG.get(action, {"icon": "❓", "label": action})
+def render_step_card(step, idx, total, step_error=None):
+    """ステップカードを描画（シンプル版：カード + メニューpopover）
+
+    ``step_error`` があるステップ（スキーマ検証に通らない）は、パラメータを
+    読み取り専用で表示する。描画のために既定値を書き込んだり型変換したり
+    しないため、壊れた値が黙って「直されて」実行されることはない。
+    """
+    action = step.get("action") if isinstance(step, dict) else None
+    config = ACTION_CONFIG.get(action, {"icon": "❓", "label": escape(str(action))})
     is_shared = action in SHARED_DEVICE_ACTIONS
     is_loop = action in ["loop_start", "loop_end"]
 
@@ -886,12 +972,19 @@ def render_step_card(step, idx, total):
     else:
         r_id = step.get("robot_id", 1)
         robot_color = ROBOT_COLORS.get(r_id, ROBOT_COLORS[1])
+        r_id = escape(str(r_id))
         bg_color = robot_color["bg"]
         border_color = robot_color["border"]
         robot_badge = f'<span style="float:right; font-size:0.9em;">{robot_color["label"]} R{r_id}</span>'
 
-    # パラメータサマリー取得
-    param_summary = get_param_summary(step)
+    # パラメータサマリー取得（壊れたステップでも描画を止めない）
+    if step_error:
+        param_summary = "⚠️ 検証エラー（読み取り専用）"
+    else:
+        try:
+            param_summary = get_param_summary(step)
+        except Exception:  # noqa: BLE001
+            param_summary = ""
 
     # カード本体（ループ用とそれ以外で分岐）
     if is_loop:
@@ -929,36 +1022,48 @@ def render_step_card(step, idx, total):
             </div>
         """, unsafe_allow_html=True)
 
+    running = is_running()
     # メニューpopover（全操作を収納）
     with st.popover("⋮ メニュー", use_container_width=True):
         st.markdown(f"**{config['icon']} {config['label']} #{idx+1}**")
 
         # 詳細設定（一番上に配置）
         st.markdown("**詳細設定**")
-        render_step_params(step, idx)
+        if step_error:
+            st.error(step_error)
+            st.caption("このステップは検証に通らないため編集できません（読み取り専用）。"
+                       "JSON を直して読み込み直すか、削除してください。")
+            st.json(step)
+        else:
+            try:
+                render_step_params(step, idx)
+            except Exception as e:  # noqa: BLE001 - 表示の失敗で他の操作を止めない
+                st.error(f"パラメータを表示できません: {e}")
+                st.json(step)
 
         # 順序変更
         st.divider()
         st.markdown("**順序変更**")
         col_up, col_down = st.columns(2)
         with col_up:
-            st.button("↑ 上へ", key=f"up_{idx}", disabled=(idx == 0), use_container_width=True,
-                      on_click=move_step, args=(idx, -1))
+            st.button("↑ 上へ", key=_wkey("up", idx), disabled=(idx == 0 or running),
+                      use_container_width=True, on_click=move_step, args=(idx, -1))
         with col_down:
-            st.button("↓ 下へ", key=f"down_{idx}", disabled=(idx == total - 1), use_container_width=True,
-                      on_click=move_step, args=(idx, 1))
+            st.button("↓ 下へ", key=_wkey("down", idx), disabled=(idx == total - 1 or running),
+                      use_container_width=True, on_click=move_step, args=(idx, 1))
 
         # ロボット選択（共有デバイス・ループ以外）
-        if not is_shared and not is_loop:
+        if not is_shared and not is_loop and not step_error:
             st.divider()
             st.markdown("**ロボット割当**")
             current_robot = step.get("robot_id", 1)
             robot_options = [f"{c['label']} {c['name']}" for c in ROBOT_COLORS.values()]
-            radio_key = f"robot_select_{idx}"
+            radio_key = _wkey("robot_select", idx)
             st.radio(
                 "ロボット選択",
                 robot_options,
-                index=current_robot - 1,
+                index=(current_robot - 1) if current_robot in ROBOT_COLORS else 0,
+                disabled=running,
                 horizontal=True,
                 key=radio_key,
                 label_visibility="collapsed",
@@ -969,8 +1074,8 @@ def render_step_card(step, idx, total):
         # 削除ボタン（赤色）
         st.divider()
         st.markdown('<div class="delete-btn">', unsafe_allow_html=True)
-        st.button("🗑 削除", key=f"del_{idx}", use_container_width=True,
-                  on_click=remove_step, args=(idx,))
+        st.button("🗑 削除", key=_wkey("del", idx), use_container_width=True,
+                  disabled=running, on_click=remove_step, args=(idx,))
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1022,16 +1127,19 @@ def render_empty_state():
             key="empty_state_prompt"
         )
 
+        running = is_running()
         btn_col, mic_col = st.columns([5, 1], vertical_alignment="bottom")
-        generate_clicked = btn_col.button("✨ AIで生成する", type="primary", use_container_width=True, key="empty_state_generate")
+        generate_clicked = btn_col.button("✨ AIで生成する", type="primary", use_container_width=True,
+                                          key="empty_state_generate", disabled=running)
         with mic_col:
             render_voice_input("empty_state")
 
-        if generate_clicked:
+        if generate_clicked and not running:
             if preset_key and not ai_prompt.strip():
                 # プリセット選択でパラメータ変更なし → テンプレートをそのまま使用
-                set_workflow(PRESET_TEMPLATES[preset_key]["template"], "プリセット")
-                st.rerun()
+                if set_workflow(PRESET_TEMPLATES[preset_key]["template"], "プリセット"):
+                    st.rerun()
+                st.error(st.session_state.error_message)
             elif ai_prompt.strip():
                 if LLM_AVAILABLE:
                     with st.spinner("生成中..."):
@@ -1039,15 +1147,14 @@ def render_empty_state():
                             template = PRESET_TEMPLATES[preset_key]["template"] if preset_key else None
                             llm_input = PRESET_TEMPLATES[preset_key]["description"] + "\n\n変更指示: " + ai_prompt if preset_key else ai_prompt
                             result = generate_workflow_from_prompt(llm_input, template=template)
-                            set_workflow(result, "AI生成")
-                            st.rerun()
                         except Exception as e:
-                            if preset_key:
-                                set_workflow(PRESET_TEMPLATES[preset_key]["template"], "プリセット")
-                                st.info("テンプレートから生成しました")
+                            # 失敗したら何も読み込まない（テンプレートを「生成結果」として
+                            # 載せることはしない）。入力した指示はそのまま残る。
+                            st.error(f"生成に失敗しました（フローは変更していません。指示を直して再実行できます）: {e}")
+                        else:
+                            if set_workflow(result, "AI生成"):
                                 st.rerun()
-                            else:
-                                st.error(f"エラー: {e}")
+                            st.error(st.session_state.error_message)
                 else:
                     st.warning("AI生成を使うには .env に GEMINI_API_KEY（または LLM_MODE=openai_compatible と LLM_BASE_URL）を設定してください")
             else:
@@ -1066,13 +1173,37 @@ def render_empty_state():
     st.markdown("---")
 
 
+def render_rejected_flow():
+    """検証に通らず読み込まなかったフローを、読み取り専用で表示する"""
+    rejected = st.session_state.get("rejected_flow")
+    if not rejected:
+        return
+    with st.expander(f"⚠️ 読み込まなかったフロー（{rejected['source']}・読み取り専用）", expanded=False):
+        st.caption("検証に通らなかったため、キャンバスには載せていません。"
+                   "JSON を修正してから読み込み直してください。")
+        st.code(rejected["error"], language="text")
+        st.json(rejected["data"])
+        if st.button("この表示を閉じる", key="dismiss_rejected_flow"):
+            st.session_state.rejected_flow = None
+            st.rerun()
+
+
 def render_workflow_canvas():
     """ワークフローキャンバス（時系列順、左右で区別、ループ対応）"""
-    steps = st.session_state.workflow_data["steps"]
+    render_rejected_flow()
+    data = st.session_state.workflow_data
+    steps = data.get("steps") if isinstance(data, dict) else None
+    if not isinstance(steps, list):
+        st.error("フローに steps の一覧がありません（読み取り専用）")
+        st.json(data)
+        return
 
     if not steps:
         render_empty_state()
         return
+
+    # ステップ単位のスキーマ検証（通らないステップは読み取り専用で描画する）
+    step_errors = flow_runner.step_errors(steps)
 
     # ヘッダー
     col_h1, col_h2 = st.columns(2)
@@ -1086,7 +1217,11 @@ def render_workflow_canvas():
 
     # 時系列順にステップを表示（左右で区別）
     for idx, step in enumerate(steps):
-        action = step["action"]
+        if not isinstance(step, dict):
+            st.error(f"#{idx + 1}: ステップが JSON オブジェクトではありません（読み取り専用）: {step!r}")
+            continue
+        action = step.get("action")
+        step_error = step_errors.get(idx)
         is_shared = action in SHARED_DEVICE_ACTIONS
         is_loop = action in ["loop_start", "loop_end"]
         robot_id = step.get("robot_id", 1) if not is_shared and not is_loop else None
@@ -1107,27 +1242,27 @@ def render_workflow_canvas():
 
         if is_loop:
             # ループ: 全幅で表示
-            render_step_card(step, idx, len(steps))
+            render_step_card(step, idx, len(steps), step_error)
         elif is_shared:
             # 共有デバイス: 中央配置
             col_l, col_c, col_r = st.columns([1, 1, 1])
             with col_c:
-                render_step_card(step, idx, len(steps))
+                render_step_card(step, idx, len(steps), step_error)
         elif robot_id == 1:
             # Robot 1: 左側
             col1, col2, col3 = st.columns(3)
             with col1:
-                render_step_card(step, idx, len(steps))
+                render_step_card(step, idx, len(steps), step_error)
         elif robot_id == 2:
             # Robot 2: 中央
             col1, col2, col3 = st.columns(3)
             with col2:
-                render_step_card(step, idx, len(steps))
+                render_step_card(step, idx, len(steps), step_error)
         else:
             # Robot 3: 右側
             col1, col2, col3 = st.columns(3)
             with col3:
-                render_step_card(step, idx, len(steps))
+                render_step_card(step, idx, len(steps), step_error)
 
         if indent_margin > 0:
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1180,22 +1315,22 @@ def render_settings_panel():
         st.rerun()
 
     st.divider()
-    st.session_state.use_mock = st.toggle(
-        "🛠 Mockモード", value=st.session_state.use_mock, disabled=running,
-        help="実機に触れず、Mock デバイスで最後まで実行します（録画・安全確認ゲートなし）",
-    )
-
-    st.divider()
-    uploaded_file = st.file_uploader("📂 JSON読込", type="json", label_visibility="collapsed")
-    if uploaded_file:
+    uploaded_file = st.file_uploader("📂 JSON読込", type="json", label_visibility="collapsed",
+                                     disabled=running,
+                                     help="検証に通ったフローだけがキャンバスに読み込まれます")
+    if uploaded_file and not running:
         file_id = uploaded_file.file_id
         if st.session_state.get("_loaded_file_id") != file_id:
+            st.session_state._loaded_file_id = file_id
             try:
-                set_workflow(json.load(uploaded_file), "読み込んだJSON")
-                st.session_state._loaded_file_id = file_id
-                st.success("読込完了")
-            except:
-                st.error("JSONエラー")
+                data = json.load(uploaded_file)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                st.error(f"JSON を読めません: {e}")
+            else:
+                if set_workflow(data, "読み込んだJSON"):
+                    st.success("読込完了")
+                else:
+                    st.error("検証に失敗したため読み込みませんでした（詳細はメイン画面）")
 
     with st.popover("📄 JSON確認"):
         st.json(st.session_state.workflow_data)
@@ -1250,17 +1385,28 @@ if st.session_state.error_message:
     st.error(st.session_state.error_message)
     st.session_state.error_message = None
 
-# ワークフロー（上部）- ヘッダーとAIボタン
+# 進捗の取り込み（バックグラウンド実行 → ログ・進捗・完了状態）
+drain_runner_events()
+
+# 実行パネル（停止 / 検証 / 実行）はキャンバスより先に描画する: キャンバスの
+# 描画中に例外が出ても、停止ボタンは必ず画面に残る。
+render_execution_panel()
+
+# ワークフロー - ヘッダーとAIボタン
 col_wf_title, col_ai_btn = st.columns([3, 1])
 with col_wf_title:
     st.markdown("##### 📋 ワークフロー")
 with col_ai_btn:
-    if st.button("✨ AIで新規作成", use_container_width=True) or st.session_state.pop("_reopen_dialog", False):
+    _ai_clicked = st.button("✨ AIで新規作成", use_container_width=True, disabled=is_running())
+    _reopen = st.session_state.pop("_reopen_dialog", False)
+    if (_ai_clicked or _reopen) and not is_running():
         ai_workflow_dialog()
 
-render_workflow_canvas()
-# 進捗の取り込み（バックグラウンド実行 → ログ・進捗・完了状態）
-drain_runner_events()
+try:
+    render_workflow_canvas()
+except Exception as _canvas_error:  # noqa: BLE001 - 停止ボタンは上で描画済み
+    st.error(f"ワークフローの描画に失敗しました（読み取り専用で表示します）: {_canvas_error}")
+    st.json(st.session_state.workflow_data)
 
 # ログエリア（固定高さ）
 st.markdown("##### 📜 ログ")
@@ -1270,8 +1416,6 @@ with st.container(height=150):
     else:
         st.code("待機中...", language="bash")
 
-# 実行パネル（下部）
-render_execution_panel()
 
 # ==========================================
 # 9. 実行中のポーリング

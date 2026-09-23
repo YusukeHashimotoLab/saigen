@@ -50,11 +50,14 @@ rejected at validation time.
 
 | `action` | Parameters | Description |
 |---|---|---|
-| `aspirate` | `volume` (0 < v ≤ 10 mL), `speed` (1–9, default 5) | Aspirate; the wrapper refuses to exceed 10 mL total |
-| `dispense` | `volume` (0 < v ≤ 10 mL), `speed` (1–9, default 5) | Dispense; refuses to exceed the held volume |
+| `aspirate` | `volume` (0.5 ≤ v ≤ 10 mL), `speed` (1–9, default 5) | Aspirate; the wrapper refuses to exceed 10 mL total |
+| `dispense` | `volume` (0.5 ≤ v ≤ 10 mL), `speed` (1–9, default 5) | Dispense; refuses to exceed the held volume |
 | `blow_out` | `go_home` (bool, default true), `speed` (1–9, default 1), `delay_ms` (int, default 3000) | Expel residual liquid |
 
 Speed 1 is slowest, 9 fastest (about 1–11 mL/s for a 10 mL tip, from the manufacturer's timing table).
+The lower bound of 0.5 mL is the real wrapper's minimum operating volume
+(`LabRobot.min_pipette_volume`); the schema enforces it so that a flow the mock
+accepts is not rejected on hardware.
 
 ### Shared devices — no `robot_id`
 
@@ -62,7 +65,7 @@ Speed 1 is slowest, 9 fastest (about 1–11 mL/s for a 10 mL tip, from the manuf
 |---|---|---|
 | `tare_scale` | `delay` (0.1–10 s, default 1.0) | Tare the electronic balance |
 | `measure_weight` | `stabilization_count` (1–10, default 3) | Read the balance; median of N readings, logged in grams |
-| `capture_and_save` | `file_path` (string, `""` = auto-generate) | Capture a webcam image |
+| `capture_and_save` | `file_path` (string, `""` = auto-generate) | Capture a webcam image. If no image is saved the step fails (and the run stops) rather than being recorded as `ok`; the same holds for `capture_microscope` |
 | `capture_microscope` | `file_path` (string, `""` = auto-generate) | Capture an image with the USB digital microscope (UVC, e.g. Sanwa Supply 400-CAM106); saved into the run's `images/` folder with `_microscope` in the name. Opens only the microscope camera; `microscope_led` opens only its serial port; `microscope_focus` opens both |
 | `microscope_led` | `on` (bool, default true), `level` (0–255, optional) | Switch the microscope's LED ring on or off and optionally set its brightness (factory level 12). Needs `microscope_port` in `config.yaml` (the UM22's CP210x serial port) |
 | `microscope_focus` | `mode` (`auto` / `position` / `step`, default `auto`), `position` (0–65535, for `position`), `direction` (`in`/`out`) and `steps` (1–100, for `step`), `timeout` (1–300 s, default 60) | Focus the microscope: single-shot autofocus, move the lens motor to a recorded position, or step it. Waits until the motor stops and writes the lens position and whether it converged to the `focus_position` / `focus_converged` columns of `measurements.csv`. Autofocus needs a textured target and a non-saturating LED level; on a blank field it hunts until `timeout` and then falls back to manual mode. For reproducibility, record the position once and replay it with `mode: "position"`. Needs `microscope_port` |
@@ -90,7 +93,11 @@ Applied before any device moves:
    opened) — every absolute target (`move_xyz`, `rotate`) is checked against the
    `workspace` section of `config.yaml`. Relative moves (`move_z`,
    `rotate_relative`, `move_radial`) depend on the start pose and are listed as
-   "unverified until run"; rule 5 checks them.
+   "unverified until run"; rule 5 checks them. The same preflight
+   (`run_flow.run_preflight` / `require_preflight`) guards all three runners: the
+   CLI (`run_flow.py`, exit code 3), the CSV runner (`run_csv.py`, exit code 3)
+   and the GUI (`src/gui/runner.py`, which refuses to start the run and shows the
+   offending steps and coordinates).
 4. **Pipette volume tracking** (run time, in the safety wrapper) — cumulative
    `aspirate` may not exceed 10 mL; `dispense` may not exceed the volume held.
 5. **Workspace limits** (run time, move by move) — `move_xyz` / `move_z` / `rotate*` targets are
@@ -118,7 +125,13 @@ Running a flow leaves a record of the run in
 `logs/<YYYY-MM-DD>/<flow name>_<timestamp>/`: `run.log`, `measurements.csv` (one row
 per step, with the weights read, the nominal pipette duration of each aspirate/dispense
 step from the Picus 2 timing table, and the photographs taken), `summary.md`,
-`metadata.json`, `images/` and a copy of the flow JSON. See
+`metadata.json`, `images/` and a copy of the flow JSON. The execution mode
+(`mock` / `real`) is recorded in `metadata.json` (`mode`), in a `mode` column of
+`measurements.csv` and in `summary.md`. Runs started within the same second get
+distinct folders (`_2`, `_3`, … suffix). When sensor recording is on, a run stops
+only a dashboard recording it started itself (`/api/start` → 200); a recording that
+was already running (409) is left running, and `metadata.json` →
+`sensor_recording.started_by_this_run` says which. See
 [`src/flow/README.md`](../src/flow/README.md).
 
 ```json

@@ -67,14 +67,14 @@ SYSTEM_PROMPT = """
 - move_xyz: {"action": "move_xyz", "robot_id": 1, "x": 200.0, "y": 100.0, "z": 50.0}
 - move_z: {"action": "move_z", "robot_id": 1, "distance": 10.0} (正で上昇、負で下降)
 - move_radial: {"action": "move_radial", "robot_id": 1, "distance": 20.0} (半径方向の相対移動。正=外向き/基部から離れる、負=内向き/基部に近づく。アームの向きは維持)
-- rotate_relative: {"action": "rotate_relative", "robot_id": 1, "angle": 90.0, "speed": "low"} (現在位置から相対回転。正=反時計回り（上から見て、+Y方向）、負=時計回り。speed: "low"=低速, "normal"=普通, "high"=高速。デフォルト: "low")
+- rotate_relative: {"action": "rotate_relative", "robot_id": 1, "angle": 90.0, "speed": "low"} (現在位置から相対回転。正=反時計回り（上から見て、+Y方向）、負=時計回り。ロボットの正面（+X 側）に立ってロボットに向かい合う操作者（operator facing the robot）から見ると、正=アーム先端が操作者の右へ、負=左へ動く。指示の「右」「左」はこの操作者の視点と解釈する。speed: "low"=低速, "normal"=普通, "high"=高速。デフォルト: "low")
 - go_home: {"action": "go_home", "robot_id": 1}
 - move_slider: {"action": "move_slider", "robot_id": 1, "position": 500.0} (スライダーを絶対位置に移動。0-1000mm)
 - move_conveyer: {"action": "move_conveyer", "robot_id": 1, "index": 0, "speed": 10.0, "duration": 5.0} (コンベアベルトを動作。speed: 速度mm/s, duration: 動作時間秒)
 
 ### 電動ピペット操作（Picus2）
-- aspirate: {"action": "aspirate", "robot_id": 1, "volume": 5.0, "speed": 5} (液体吸引。volume: 0.01-10.0 mL, speed: 1-9)
-- dispense: {"action": "dispense", "robot_id": 1, "volume": 5.0, "speed": 5} (液体分注。volume: 0.01-10.0 mL, speed: 1-9)
+- aspirate: {"action": "aspirate", "robot_id": 1, "volume": 5.0, "speed": 5} (液体吸引。volume: 0.5-10.0 mL（実機ピペットの最小操作量 0.5 mL）, speed: 1-9)
+- dispense: {"action": "dispense", "robot_id": 1, "volume": 5.0, "speed": 5} (液体分注。volume: 0.5-10.0 mL（実機ピペットの最小操作量 0.5 mL）, speed: 1-9)
 - blow_out: {"action": "blow_out", "robot_id": 1, "go_home": true, "speed": 1, "delay_ms": 3000} (残液完全排出)
 
 ### カメラ操作（Webcam）※共有デバイスのためrobot_id不要
@@ -112,7 +112,7 @@ SYSTEM_PROMPT = """
 }
 ```
 
-### 例2: 「右に90°回転して70mm下降して5ml排出して70mm上昇してホームに戻る」
+### 例2: 「（ロボットに向かい合う操作者から見て）右に90°回転して70mm下降して5ml排出して70mm上昇してホームに戻る」
 ```json
 {
   "name": "分注後帰還",
@@ -172,11 +172,59 @@ def _build_prompt(user_input: str, template: dict = None) -> str:
         return (
             f"{SYSTEM_PROMPT}\n\n"
             f"以下のJSONテンプレートのパラメータを、ユーザーの指示に従って変更してください。\n"
-            f"テンプレートの構造（ステップの順序・種類）は変更せず、指定されたパラメータのみ変更してください。\n\n"
+            f"テンプレートの構造（ステップの数・順序・種類、robot_id、loop_id）は変更せず、指定されたパラメータの値のみ変更してください。構造が変わった出力は採用されません。\n\n"
             f"テンプレートJSON:\n{json.dumps(template, ensure_ascii=False)}\n\n"
             f"ユーザーの指示:\n{user_input}"
         )
     return f"{SYSTEM_PROMPT}\n\n指示: {user_input}"
+
+
+class TemplateStructureError(ValueError):
+    """テンプレート指定の生成で、LLM がステップの構造を変えた。
+
+    テンプレートは実機で確認済みの手順なので、変えてよいのはパラメータ
+    （移動量・角度・容量・速度・待ち時間・ループ回数など）だけ。ステップの
+    追加・削除・並べ替え・アクションや robot_id / loop_id の変更は拒否する。
+    """
+
+
+# テンプレートの「構造」とみなすキー（値が変わったら構造変更）
+_STRUCTURAL_KEYS = ("action", "robot_id", "loop_id")
+
+
+def _step_signature(step) -> tuple:
+    if not isinstance(step, dict):
+        return ("<not an object>",)
+    return tuple(step.get(k) for k in _STRUCTURAL_KEYS)
+
+
+def check_template_structure(template: dict, generated) -> None:
+    """生成結果がテンプレートと同じ構造（同じアクションを同じ順序で、同じ
+    robot_id / loop_id）かを確認し、違えば :class:`TemplateStructureError`。
+
+    パラメータの値、および省略可能なパラメータの追加・省略は許す（それは
+    スキーマ検証 src/flow/schema.py が別途確認する）。
+    """
+    if not isinstance(generated, dict) or not isinstance(generated.get("steps"), list):
+        raise TemplateStructureError("生成結果に steps の一覧がありません（テンプレートの構造と異なります）")
+    t_steps = template.get("steps") or []
+    g_steps = generated["steps"]
+    problems = []
+    if len(t_steps) != len(g_steps):
+        problems.append(f"ステップ数が変わっています（テンプレート {len(t_steps)} → 生成 {len(g_steps)}）")
+    for i, (t, g) in enumerate(zip(t_steps, g_steps), 1):
+        ts, gs = _step_signature(t), _step_signature(g)
+        if ts != gs:
+            diffs = [f"{k}: {a!r} → {b!r}" for k, a, b in zip(_STRUCTURAL_KEYS, ts, gs) if a != b]
+            problems.append(f"ステップ {i}: " + ", ".join(diffs or ["形式が異なります"]))
+        if len(problems) >= 10:
+            problems.append("...")
+            break
+    if problems:
+        raise TemplateStructureError(
+            "生成結果がテンプレートの構造を変えたため採用しません"
+            "（テンプレートで変えられるのはパラメータの値だけです）:\n- " + "\n- ".join(problems)
+        )
 
 
 def _generate_openai_compatible(prompt: str) -> str:
@@ -266,13 +314,22 @@ def generate_workflow_from_prompt(user_input: str, template: dict = None) -> dic
     Args:
         user_input: ユーザーの自然言語指示
         template: プリセットのテンプレートJSON（指定時はパラメータ変更のみ行う）
+
+    Raises:
+        TemplateStructureError: ``template`` 指定時に、生成結果のステップ構造
+            （アクションの種類と順序、robot_id、loop_id）がテンプレートと違う
+        ValueError / RuntimeError: 生成・JSON パースに失敗した。失敗時に
+            テンプレートをそのまま返すことはしない（呼び出し側が失敗を表示する）
     """
     prompt = _build_prompt(user_input, template)
     mode = _llm_mode()
     try:
         raw = _generate(prompt, mode)
-        return _parse_json_with_retry(raw, prompt, mode)
+        result = _parse_json_with_retry(raw, prompt, mode)
     except (ValueError, RuntimeError):
         raise
     except Exception as e:
         raise RuntimeError(f"ワークフロー生成に失敗しました: {e}")
+    if template:
+        check_template_structure(template, result)
+    return result

@@ -7,6 +7,14 @@ from typing import Literal, Union, List, Optional
 # 0. 共通の基底モデル
 # ==========================================
 
+#: ピペット 1 回の最小操作量 (mL)。実機ラッパー LabRobot.min_pipette_volume と
+#: 同じ値にしておくこと（Mock は最小値を検査しないため、スキーマで揃えないと
+#: Mock で通ったフローが実機で拒否される）。tests/test_phase2_schema_volume.py が一致を確認する。
+PIPETTE_MIN_VOLUME_ML = 0.5
+#: ピペットの最大容量 (mL)。LabRobot.max_pipette_volume と同じ。
+PIPETTE_MAX_VOLUME_ML = 10.0
+
+
 class _StrictModel(BaseModel):
     """全アクションとワークフローの基底。
 
@@ -245,9 +253,9 @@ class ActionAspirate(_StrictModel):
     )
     volume: float = Field(
         ...,
-        gt=0,
-        le=10.0,
-        description="吸引量 (mL)。0より大きく10mL以下"
+        ge=PIPETTE_MIN_VOLUME_ML,
+        le=PIPETTE_MAX_VOLUME_ML,
+        description="吸引量 (mL)。0.5 mL 以上 10 mL 以下（実機ピペットの最小操作量が 0.5 mL）"
     )
     speed: int = Field(
         default=5,
@@ -277,9 +285,9 @@ class ActionDispense(_StrictModel):
     )
     volume: float = Field(
         ...,
-        gt=0,
-        le=10.0,
-        description="分注量 (mL)。0より大きく保持量以下"
+        ge=PIPETTE_MIN_VOLUME_ML,
+        le=PIPETTE_MAX_VOLUME_ML,
+        description="分注量 (mL)。0.5 mL 以上で保持量以下（実機ピペットの最小操作量が 0.5 mL）"
     )
     speed: int = Field(
         default=5,

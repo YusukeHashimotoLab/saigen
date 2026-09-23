@@ -33,11 +33,20 @@ flow behaves identically whether it is started from the browser or the terminal.
   (`src/flow/schema.py`) and its loops are expanded *before* any device is opened.
   A flow that fails validation is refused: the errors are listed in the UI (one line
   per offending step) and no `ExperimentSession` is created. Flows arriving from the
-  agent, a preset or an uploaded JSON file are validated on arrival as well, and the
-  *Validate* button re-checks the current canvas without running it.
-- **Mock / Real** — *Mock* runs the whole flow against `MockLabRobot` /
-  `MockSharedDevices`, writing the same log folder as a real run; nothing is recorded
-  and the safety gate is not queried. *Real* drives the instruments.
+  agent, a preset or an uploaded JSON file are validated on arrival and **replace the
+  canvas only if they validate**; a rejected flow is kept out of the canvas and shown
+  read-only with its errors. The *Validate* button re-checks the current canvas
+  (schema, loops and the workspace preflight) without running it. The same workspace
+  preflight as the CLI runs before every start. Steps on the canvas that do not pass
+  the schema are drawn read-only: drawing never writes defaults or coerced values
+  into the flow; values change only when the user edits a widget.
+- **Mock by default; real runs are armed explicitly** — ▶ runs in *Mock* (against
+  `MockLabRobot` / `MockSharedDevices`, same log folder as a real run, no recording,
+  no safety gate). A real run needs the checkbox *実機で実行する* ticked in the current
+  browser session **and** approval in a confirmation dialog; the checkbox clears itself
+  when a real run starts. The execution panel (Stop / Validate / Run) is drawn before
+  the canvas, so an error while drawing the canvas cannot hide the Stop button. While a
+  run is active, JSON import, AI generation and all canvas edits are disabled.
 - **Stop** — cancels the running flow. Cancellation lands in `ExperimentSession`'s
   abort path, the same one Ctrl+C takes on the CLI: every robot is emergency-stopped,
   all devices are disconnected, and the run folder is finalised with
@@ -47,8 +56,12 @@ flow behaves identically whether it is started from the browser or the terminal.
   including the device-level messages (balance readings, image paths).
 - **Monitoring hook** — in Real mode, if the sensor dashboard (`src/monitoring`) is
   reachable at `SENSOR_SERVER_URL` (default `http://localhost:8000`), recording is
-  started before the run and stopped after it, and the dashboard's `/api/is_safe`
-  check gates every step (an unreachable dashboard does not block the run).
+  started before the run and stopped after it (only if this run started it — a 409 on
+  `/api/start` means someone else's recording, which is left running), and the
+  dashboard's `/api/is_safe` check gates every step. Only a JSON `"safe": true`
+  passes; anything else (`"false"`, `1`, missing, HTTP error) raises `SafetyAbort`,
+  which stops the hardware in place without a go-home move. An unreachable dashboard
+  does not block the run.
 
 ## Device settings (sidebar)
 
@@ -72,7 +85,7 @@ logs/<date>/<flow name>_<timestamp>/
     <flow>.json           a copy of the flow that was executed
     measurements.csv      one row per step (weight, image path, status, duration)
     dispense_accuracy.csv each dispense paired with the mass weighed after it
-    metadata.json         start/end, status, robots used, counts
+    metadata.json         start/end, status, mode (mock/real), robots used, counts
     summary.md            human-readable report
     images/               pictures taken by capture_and_save
 ```

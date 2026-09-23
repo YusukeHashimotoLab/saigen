@@ -20,7 +20,7 @@ validator and leaves behind exactly the same `logs/<date>/<name>_<timestamp>/` f
 Input CSV format (`parameter,value,note`, see `control.example.csv`):
 
     parameter,value,note
-    robot1_volume_mL,5.0,Robot 1 aspirate/dispense volume (0-10 mL; 0 skips Robot 1)
+    robot1_volume_mL,5.0,Robot 1 aspirate/dispense volume (0 skips Robot 1; otherwise 0.5-10 mL)
     ...
 
 Results are also written back next to the input CSV as `results.csv`, so the operator
@@ -51,7 +51,7 @@ from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession
-from src.flow.schema import ExperimentWorkflow
+from src.flow.schema import PIPETTE_MIN_VOLUME_ML, ExperimentWorkflow
 
 load_dotenv()
 logger = logging.getLogger("run_csv")
@@ -112,12 +112,12 @@ parse_bool.__name__ = "boolean"
 # `capture_photo`). A spec without "min"/"max" is not range-checked.
 PARAM_SPECS: Dict[str, dict] = {
     "robot1_volume_mL": {
-        "type": float, "min": 0.0, "max": 10.0,
-        "note": "Robot 1 aspirate/dispense volume (0-10 mL; 0 skips Robot 1)",
+        "type": float, "min": 0.0, "max": 10.0, "nonzero_min": PIPETTE_MIN_VOLUME_ML,
+        "note": "Robot 1 aspirate/dispense volume (0 skips Robot 1, otherwise 0.5-10 mL)",
     },
     "robot2_volume_mL": {
-        "type": float, "min": 0.0, "max": 10.0,
-        "note": "Robot 2 aspirate/dispense volume (0-10 mL; 0 skips Robot 2)",
+        "type": float, "min": 0.0, "max": 10.0, "nonzero_min": PIPETTE_MIN_VOLUME_ML,
+        "note": "Robot 2 aspirate/dispense volume (0 skips Robot 2, otherwise 0.5-10 mL)",
     },
     "aspirate_z_descent_mm": {
         "type": float, "min": 0.1, "max": 200.0,
@@ -185,11 +185,17 @@ def default_csv_path() -> str:
 def load_params_from_csv(csv_path: str) -> dict:
     """Read the CSV and convert/range-check every value in PARAM_SPECS.
 
+    Rows whose `parameter` cell is empty or starts with `#` are comments. Every
+    other row must name a parameter in PARAM_SPECS exactly once: an unknown name
+    (usually a typo such as `robot1_volume_ml`, which would otherwise leave the
+    real row at its default) and a name given twice are both errors, reported
+    with their line number in the file (the header is line 1).
+
     Raises:
         ValueError: with every problem found, so the operator can fix the whole
             spreadsheet in one pass instead of one error per run.
     """
-    raw = {}
+    raw, first_line, errors = {}, {}, []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         fields = reader.fieldnames or []
@@ -199,11 +205,22 @@ def load_params_from_csv(csv_path: str) -> dict:
                 f"(found: {fields})"
             )
         for row in reader:
+            line = reader.line_num
             key = (row.get("parameter") or "").strip()
-            if key:
-                raw[key] = row.get("value")
+            if not key or key.startswith("#"):
+                continue
+            if key not in PARAM_SPECS:
+                errors.append(f"line {line}: unknown parameter '{key}' "
+                              f"(known: {', '.join(PARAM_SPECS)})")
+                continue
+            if key in raw:
+                errors.append(f"line {line}: '{key}' is given twice "
+                              f"(first on line {first_line[key]})")
+                continue
+            raw[key] = row.get("value")
+            first_line[key] = line
 
-    params, errors = {}, []
+    params = {}
     for name, spec in PARAM_SPECS.items():
         if name not in raw or raw[name] in (None, ""):
             if "default" in spec:
@@ -225,6 +242,14 @@ def load_params_from_csv(csv_path: str) -> dict:
         if "min" in spec and not (spec["min"] <= value <= spec["max"]):
             errors.append(
                 f"'{name}'={value} is out of range ({spec['min']} to {spec['max']})"
+            )
+            continue
+        if "nonzero_min" in spec and value != 0 and value < spec["nonzero_min"]:
+            # 0 means "skip this robot"; any other volume must be one the real
+            # pipette wrapper accepts (the mock does not check the minimum).
+            errors.append(
+                f"'{name}'={value} is below the pipette minimum "
+                f"{spec['nonzero_min']} mL (use 0 to skip the robot)"
             )
             continue
         params[name] = value
@@ -380,6 +405,11 @@ async def run_two_solution_mixing(
 ) -> dict:
     """Run the fixed sequence built from `params`.
 
+    The workspace preflight runs before the run folder is created or any device
+    is opened; a violation raises `run_flow.PreflightError`. (The fixed CSV
+    sequence uses only relative moves, which are reported as unverified and
+    checked move by move at run time.)
+
     Returns:
         {"robot1_weight_g": float|None, "robot2_weight_g": float|None,
          "log_dir": str, "status": str}
@@ -388,11 +418,18 @@ async def run_two_solution_mixing(
     steps = expand_loops([s.model_dump() for s in workflow.steps])
     results = {"robot1_weight_g": None, "robot2_weight_g": None}
 
+    validator = default_workspace_validator()
+    report = run_flow.preflight_workspace(steps, validator)
+    if not report.ok:
+        run_flow.log_preflight(report, validator, log=logger)
+        raise run_flow.PreflightError(report, run_flow.violation_message(report))
+
     (robot_ids, picus2_robots, needs_scale, needs_camera,
      needs_microscope, needs_microscope_serial) = run_flow.plan_resources(steps)
 
     exp_logger = ExperimentLogger(
-        workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR
+        workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR,
+        mode="mock" if mock else "real",
     )
     exp_logger.record_resources(robot_ids, picus2_robots)
     logger.info(f"experiment log folder: {exp_logger.dir}")
@@ -419,9 +456,12 @@ async def run_two_solution_mixing(
     )
 
     video_recorder = None
+    recording = None
     if record:
         if run_flow.ensure_dashboard_running():
-            save_dir = run_flow.start_csv_recording(workflow.name) or exp_logger.dir
+            recording = run_flow.start_csv_recording(workflow.name)
+            exp_logger.record_recording(recording.as_metadata())
+            save_dir = recording.save_dir or exp_logger.dir
             try:
                 from src.monitoring.camera.video_recorder import VideoRecorder
                 video_recorder = VideoRecorder(
@@ -442,7 +482,7 @@ async def run_two_solution_mixing(
         mock=mock,
         robot_ports=robot_ports,
         shared_config=shared_config,
-        workspace_validator=default_workspace_validator(),
+        workspace_validator=validator,
     )
 
     async def body():
@@ -498,9 +538,10 @@ async def run_two_solution_mixing(
                 video_recorder.stop()
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"error stopping the video recording: {e}")
-        if record:
+        if recording is not None:
             try:
-                run_flow.stop_csv_recording()
+                # only a recording this run started (/api/start -> 200) is stopped
+                run_flow.stop_csv_recording(recording)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"error stopping the CSV recording: {e}")
         try:
@@ -533,7 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock", action="store_true",
                    help="run without hardware (log only; recording always off)")
     p.add_argument("--validate-only", action="store_true",
-                   help="read the CSV and build the step list, but do not run")
+                   help="read the CSV, build and validate the step list and run the "
+                        "workspace preflight, but open no device")
     for rid in (1, 2, 3):
         p.add_argument(f"--robot{rid}-dobot", default=None,
                        help=f"Robot {rid} Dobot port "
@@ -584,6 +626,12 @@ def main(argv=None) -> int:
         return 2
 
     logger.info(f"steps built from the CSV: {len(workflow.steps)}")
+
+    # Workspace preflight, same as run_flow: before any device is opened, and
+    # with --validate-only too. Exit code 3 on a violation.
+    steps = expand_loops([s.model_dump() for s in workflow.steps])
+    if not run_flow.run_preflight(steps, log=logger).ok:
+        return run_flow.PREFLIGHT_EXIT_CODE
     if args.validate_only:
         logger.info("validation only (--validate-only)")
         return 0
@@ -600,6 +648,9 @@ def main(argv=None) -> int:
             robot_ports=robot_ports,
             shared_config=shared_config,
         ))
+    except run_flow.PreflightError as e:
+        logger.error(str(e))
+        return run_flow.PREFLIGHT_EXIT_CODE
     except KeyboardInterrupt:
         # The emergency stop and cleanup already ran inside ExperimentSession.
         logger.warning("interrupted (emergency stop and cleanup done)")
