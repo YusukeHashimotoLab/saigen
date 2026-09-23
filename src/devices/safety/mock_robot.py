@@ -245,10 +245,11 @@ class MockSharedDevices:
     MOCK_WEIGHT = 4.98
 
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
-                 use_microscope: bool = False, **_ignored):
+                 use_microscope: bool = False, use_microscope_serial: bool = False, **_ignored):
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
+        self.use_microscope_serial = use_microscope_serial
         self._captures = 0
         self._microscope_captures = 0
         self.microscope_led_on = True

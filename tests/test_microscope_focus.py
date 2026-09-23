@@ -170,7 +170,8 @@ def test_goto_position_writes_bytes_and_waits():
 def test_step_focus_presses_and_releases():
     port = FakeMotorPort(pos=1568)
     s = _scope(port)
-    pos = s.step_focus("out", steps=2)
+    pos, completed = s.step_focus("out", steps=2)
+    assert completed is True
     assert pos == 1568 + 14, "each step lands where the fake motor moves per press"
     assert port.sent.count("W0153") == 2 and port.sent.count("W0193") == 2
     with pytest.raises(ValueError):
@@ -218,16 +219,16 @@ class FakeSerialCtl:
         self.calls.append(("goto", position, timeout_s))
         return position, True
 
-    def step_focus(self, direction, steps):
+    def step_focus(self, direction, steps, timeout_s=60.0):
         self.calls.append(("step", direction, steps))
-        return 1582
+        return 1582, True
 
 
 def test_shared_devices_focus_dispatch(monkeypatch):
     import src.devices.microscope as pkg
     monkeypatch.setattr(pkg, "MicroscopeController", FakeCamera)
     monkeypatch.setattr(pkg, "UM22SerialController", FakeSerialCtl)
-    shared = SharedDevices(use_microscope=True, microscope_index=2, microscope_port="COM77")
+    shared = SharedDevices(use_microscope=True, use_microscope_serial=True, microscope_index=2, microscope_port="COM77")
     assert asyncio.run(shared.initialize()) is True
     ctl = shared.microscope_serial
     assert asyncio.run(shared.focus_microscope("auto", timeout=30)) == {"focus_position": 1400, "focus_converged": True}
@@ -288,7 +289,7 @@ def test_logger_writes_focus_position_column(tmp_path):
 
 
 def test_plan_resources_focus_needs_microscope():
-    ids, picus, scale, camera, microscope = run_flow.plan_resources([{"action": "microscope_focus"}])
+    ids, picus, scale, camera, microscope, serial = run_flow.plan_resources([{"action": "microscope_focus"}])
     assert (ids, scale, camera, microscope) == ([], False, False, True)
 
 

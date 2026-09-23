@@ -26,6 +26,9 @@ _default_logger = logging.getLogger(__name__)
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
                          "capture_microscope", "microscope_led", "microscope_focus"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
+# 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
+MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
+MICROSCOPE_SERIAL_ACTIONS = {"microscope_led", "microscope_focus"}
 
 # ループ制御アクション（実行時にスキップ）
 LOOP_CONTROL_ACTIONS = {"loop_start", "loop_end"}
@@ -339,7 +342,8 @@ async def execute_workflow(json_path: str, robot_settings: dict = None, shared_s
     needs_shared_devices = bool(actions_in_workflow & SHARED_DEVICE_ACTIONS)
     needs_scale = "measure_weight" in actions_in_workflow or "tare_scale" in actions_in_workflow
     needs_camera = "capture_and_save" in actions_in_workflow
-    needs_microscope = bool(actions_in_workflow & MICROSCOPE_ACTIONS)
+    needs_microscope = bool(actions_in_workflow & MICROSCOPE_CAMERA_ACTIONS)
+    needs_microscope_serial = bool(actions_in_workflow & MICROSCOPE_SERIAL_ACTIONS)
 
     # 4. LabRobot初期化 & 実行ループ
     async with LabRobot(use_dobot=True, **robot_settings) as robot:
@@ -350,6 +354,7 @@ async def execute_workflow(json_path: str, robot_settings: dict = None, shared_s
                 use_scale=needs_scale,
                 use_camera=needs_camera,
                 use_microscope=needs_microscope,
+                use_microscope_serial=needs_microscope_serial,
                 **shared_settings
             )
             if not await shared_devices.initialize():

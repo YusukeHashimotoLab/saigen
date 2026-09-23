@@ -211,13 +211,13 @@ def test_shared_devices_open_serial_only_when_port_configured(monkeypatch):
     monkeypatch.setattr(pkg, "UM22SerialController", FakeSerialCtl)
     FakeSerialCtl.instances.clear()
 
-    shared = SharedDevices(use_microscope=True, microscope_index=2)   # no port configured
+    shared = SharedDevices(use_microscope=True, microscope_index=2, microscope_port="COM77")   # camera only
     assert asyncio.run(shared.initialize()) is True
     assert FakeSerialCtl.instances == []
     with pytest.raises(RuntimeError):
         asyncio.run(shared.set_microscope_led(False))
 
-    shared = SharedDevices(use_microscope=True, microscope_index=2, microscope_port="COM77")
+    shared = SharedDevices(use_microscope_serial=True, microscope_index=2, microscope_port="COM77")
     assert asyncio.run(shared.initialize()) is True
     ctl = FakeSerialCtl.instances[0]
     assert ctl.port == "COM77"
@@ -254,9 +254,9 @@ def test_executor_routes_microscope_led():
 
 
 def test_plan_resources_led_needs_microscope():
-    ids, picus, scale, camera, microscope = run_flow.plan_resources(
+    ids, picus, scale, camera, microscope, serial = run_flow.plan_resources(
         [{"action": "microscope_led", "on": False}])
-    assert (ids, scale, camera, microscope) == ([], False, False, True)
+    assert (ids, scale, camera, microscope, serial) == ([], False, False, False, True)
 
 
 def test_resolve_ports_microscope_port(monkeypatch):

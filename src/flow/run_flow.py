@@ -49,7 +49,7 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_ACTIONS
+from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession
 from src.flow.schema import ExperimentWorkflow
@@ -244,9 +244,11 @@ def resolve_ports(args) -> Tuple[dict, dict]:
                   else os.getenv("MICROSCOPE_INDEX"))
     if microscope not in (None, ""):
         shared_config["microscope_index"] = int(microscope)
-    microscope_port = getattr(args, "microscope_port", None) or os.getenv("MICROSCOPE_PORT")
-    if microscope_port:
-        shared_config["microscope_port"] = microscope_port
+    cli_port = getattr(args, "microscope_port", None)
+    if cli_port is not None:                       # "" は「制御ポートを使わない」の明示
+        shared_config["microscope_port"] = cli_port
+    elif os.getenv("MICROSCOPE_PORT"):
+        shared_config["microscope_port"] = os.getenv("MICROSCOPE_PORT")
 
     return robot_ports, shared_config
 
@@ -282,8 +284,10 @@ def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
             picus2_robots.add(rid)
     needs_scale = bool(actions & {"measure_weight", "tare_scale"})
     needs_camera = "capture_and_save" in actions
-    needs_microscope = bool(actions & MICROSCOPE_ACTIONS)
-    return sorted(robot_ids), picus2_robots, needs_scale, needs_camera, needs_microscope
+    needs_microscope = bool(actions & MICROSCOPE_CAMERA_ACTIONS)          # 顕微鏡カメラ
+    needs_microscope_serial = bool(actions & MICROSCOPE_SERIAL_ACTIONS)   # 顕微鏡の制御ポート
+    return (sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
+            needs_microscope, needs_microscope_serial)
 
 
 def _fmt_params(step: dict) -> str:
@@ -299,8 +303,9 @@ async def run(args) -> int:
         logger.error("ステップが空です")
         return 2
 
-    robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope = plan_resources(steps)
-    needs_shared = needs_scale or needs_camera or needs_microscope
+    (robot_ids, picus2_robots, needs_scale, needs_camera,
+     needs_microscope, needs_microscope_serial) = plan_resources(steps)
+    needs_shared = needs_scale or needs_camera or needs_microscope or needs_microscope_serial
     robot_ports, shared_config = resolve_ports(args)
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
@@ -324,7 +329,8 @@ async def run(args) -> int:
         logger.info(f"ピペット使用: Robot {sorted(picus2_robots)}")
     if needs_shared:
         parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera),
-                                   ("顕微鏡", needs_microscope)) if need]
+                                   ("顕微鏡カメラ", needs_microscope),
+                                   ("顕微鏡制御ポート", needs_microscope_serial)) if need]
         logger.info(f"共有デバイス: {', '.join(parts)}")
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
@@ -360,7 +366,8 @@ async def run(args) -> int:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
         if needs_shared:
             await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                     use_microscope=needs_microscope)
+                                     use_microscope=needs_microscope,
+                                     use_microscope_serial=needs_microscope_serial)
 
         logger.info("=== フロー実行開始 ===")
         total = len(steps)

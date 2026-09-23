@@ -815,7 +815,7 @@ def render_step_params(step, idx):
                                  on_change=_update_step_param, args=(idx, "on", f"mled_on_{idx}"))
         set_level = st.checkbox("明るさも設定する", value=step.get("level") is not None, key=f"mled_setlv_{idx}")
         if set_level:
-            step["level"] = st.number_input("明るさ (0-255、出荷時 12)", value=int(step.get("level") or 12),
+            step["level"] = st.number_input("明るさ (0-255、出荷時 12)", value=int(12 if step.get("level") is None else step.get("level")),
                                             min_value=0, max_value=255, key=f"mled_lv_{idx}",
                                             on_change=_update_step_param, args=(idx, "level", f"mled_lv_{idx}"))
         else:
@@ -826,7 +826,7 @@ def render_step_params(step, idx):
         step["mode"] = st.selectbox("モード", modes, index=modes.index(step.get("mode", "auto")), key=f"mf_mode_{idx}",
                                     on_change=_update_step_param, args=(idx, "mode", f"mf_mode_{idx}"))
         if step["mode"] == "position":
-            step["position"] = st.number_input("レンズ位置 (0-65535)", value=int(step.get("position") or 1568),
+            step["position"] = st.number_input("レンズ位置 (0-65535)", value=int(1568 if step.get("position") is None else step.get("position")),
                                                min_value=0, max_value=65535, key=f"mf_pos_{idx}",
                                                on_change=_update_step_param, args=(idx, "position", f"mf_pos_{idx}"))
         elif step["mode"] == "step":

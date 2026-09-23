@@ -122,7 +122,7 @@ def test_focus_keeps_reading_frames_while_motor_moves(monkeypatch):
     import src.devices.microscope as pkg
     monkeypatch.setattr(pkg, "MicroscopeController", FakeMicroscope)
     monkeypatch.setattr(pkg, "UM22SerialController", SlowSerial)
-    shared = SharedDevices(use_microscope=True, microscope_index=2, microscope_port="COM77")
+    shared = SharedDevices(use_microscope=True, use_microscope_serial=True, microscope_index=2, microscope_port="COM77")
     assert asyncio.run(shared.initialize()) is True
     result = asyncio.run(shared.focus_microscope("auto", timeout=5))
     assert result == {"focus_position": 1600, "focus_converged": True}

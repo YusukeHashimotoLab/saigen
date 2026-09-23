@@ -1,6 +1,6 @@
 #jsonの型検証ファイル（validation有）
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Literal, Union, List, Optional
 
 # ==========================================
@@ -419,6 +419,12 @@ class ActionMicroscopeFocus(BaseModel):
         le=300.0,
         description="モーター停止を待つ上限秒。AF が収束しない場合はこの時間で手動モードに戻す"
     )
+
+    @model_validator(mode="after")
+    def _position_required_for_position_mode(self):
+        if self.mode == "position" and self.position is None:
+            raise ValueError("microscope_focus: mode='position' には position (0-65535) が必要です")
+        return self
 
 # ==========================================
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)

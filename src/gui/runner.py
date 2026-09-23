@@ -388,7 +388,8 @@ class FlowRunner:
 
         steps = self.steps
         total = len(steps)
-        robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope = plan_resources(steps)
+        (robot_ids, picus2_robots, needs_scale, needs_camera,
+         needs_microscope, needs_microscope_serial) = plan_resources(steps)
 
         exp_logger = ExperimentLogger(
             self.workflow.name,
@@ -435,9 +436,10 @@ class FlowRunner:
         async def body():
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-            if needs_scale or needs_camera or needs_microscope:
+            if needs_scale or needs_camera or needs_microscope or needs_microscope_serial:
                 await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                         use_microscope=needs_microscope)
+                                         use_microscope=needs_microscope,
+                                         use_microscope_serial=needs_microscope_serial)
 
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop

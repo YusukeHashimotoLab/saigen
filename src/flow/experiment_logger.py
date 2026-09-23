@@ -120,6 +120,7 @@ class ExperimentLogger:
         image_path = result.get("image_path")
         nominal_time = result.get("nominal_time_s")
         focus_position = result.get("focus_position")
+        focus_converged = result.get("focus_converged")
 
         record = {
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -135,6 +136,7 @@ class ExperimentLogger:
             "nominal_time_s": f"{nominal_time:.2f}" if isinstance(nominal_time, (int, float)) else "",
             "image_path": image_path or "",
             "focus_position": str(focus_position) if isinstance(focus_position, int) else "",
+            "focus_converged": ("" if focus_converged is None else ("True" if focus_converged else "False")),
             "error": error or "",
         }
         self.records.append(record)
@@ -188,7 +190,8 @@ class ExperimentLogger:
     def _write_csv(self):
         fields = ["timestamp", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
-                  "weight_g", "nominal_time_s", "image_path", "focus_position", "error"]
+                  "weight_g", "nominal_time_s", "image_path", "focus_position",
+                  "focus_converged", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -298,6 +301,8 @@ class ExperimentLogger:
                 note = os.path.basename(r["image_path"])
             elif r.get("focus_position"):
                 note = f"lens {r['focus_position']}"
+                if r.get("focus_converged") == "False":
+                    note += " (not converged)"
             elif r["error"]:
                 note = f"⚠️ {r['error']}"
             state = "✅" if r["status"] == "ok" else "❌"

@@ -45,6 +45,7 @@ class SharedDevices:
                  use_scale: bool = False,
                  use_camera: bool = False,
                  use_microscope: bool = False,
+                 use_microscope_serial: bool = False,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -52,7 +53,10 @@ class SharedDevices:
         Args:
             use_scale: 電子天秤（BCE8221）を使用するか
             use_camera: Webcamを使用するか
-            use_microscope: USB デジタル顕微鏡（UVC）を使用するか
+            use_microscope: USB デジタル顕微鏡のカメラ（UVC）を使用するか
+                （capture_microscope / microscope_focus）
+            use_microscope_serial: 顕微鏡の制御ポート（LED・フォーカスモーター）を使用するか
+                （microscope_led / microscope_focus）。microscope_port が必要
             **device_configs: デバイス固有の設定
                 - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
@@ -66,6 +70,7 @@ class SharedDevices:
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
+        self.use_microscope_serial = use_microscope_serial
 
         # デバイスインスタンス（初期化前はNone）
         self.scale = None
@@ -102,9 +107,12 @@ class SharedDevices:
                 if not await self._initialize_camera():
                     return False
 
-            # Microscope（USB デジタル顕微鏡）の初期化
+            # Microscope（USB デジタル顕微鏡）の初期化: カメラと制御ポートは別々に開く
             if self.use_microscope:
                 if not await self._initialize_microscope():
+                    return False
+            if self.use_microscope_serial:
+                if not await self._initialize_microscope_serial():
                     return False
 
             self._initialized = True
@@ -159,37 +167,61 @@ class SharedDevices:
             return False
 
     async def _initialize_microscope(self) -> bool:
-        """USB デジタル顕微鏡（UVC）を初期化"""
+        """USB デジタル顕微鏡のカメラ（UVC）を初期化。失敗時はハンドルを残さない"""
         try:
-            logger.info("デジタル顕微鏡を初期化中...")
+            logger.info("デジタル顕微鏡（カメラ）を初期化中...")
             from src.devices.microscope import MicroscopeController
 
             microscope_index = self.device_configs.get('microscope_index', 2)
             resolution = parse_resolution(self.device_configs.get('microscope_resolution'))
-            self.microscope = MicroscopeController(camera_index=microscope_index, resolution=resolution)
-
-            if not self.microscope.connect():
-                logger.error("デジタル顕微鏡の接続に失敗しました")
+            microscope = MicroscopeController(camera_index=microscope_index, resolution=resolution)
+            if not microscope.connect():
+                logger.error("デジタル顕微鏡（カメラ）の接続に失敗しました")
+                self._release_quietly(microscope)
                 return False
-
-            # 制御用シリアル（LED 等）は port が設定されているときだけ開く
-            microscope_port = self.device_configs.get('microscope_port') or ""
-            if microscope_port:
-                from src.devices.microscope import UM22SerialController
-                self.microscope_serial = UM22SerialController(port=microscope_port)
-                if not self.microscope_serial.connect():
-                    logger.error(f"デジタル顕微鏡の制御ポート {microscope_port} に接続できません")
-                    self.microscope_serial = None
-                    return False
-                logger.info(f"✓ デジタル顕微鏡 制御ポート接続完了 ({microscope_port}, "
-                            f"{self.microscope_serial.get_model()})")
-
-            logger.info("✓ デジタル顕微鏡初期化完了")
+            self.microscope = microscope
+            logger.info("✓ デジタル顕微鏡（カメラ）初期化完了")
             return True
 
         except Exception as e:
-            logger.error(f"デジタル顕微鏡初期化エラー: {e}")
+            logger.error(f"デジタル顕微鏡（カメラ）初期化エラー: {e}")
             return False
+
+    async def _initialize_microscope_serial(self) -> bool:
+        """顕微鏡の制御ポート（UM22 系の CP210x シリアル）を初期化"""
+        microscope_port = self.device_configs.get('microscope_port') or ""
+        if not microscope_port:
+            logger.error("顕微鏡の制御ポートが未設定です "
+                         "(config.yaml の shared_devices.microscope_port を設定してください)")
+            return False
+        try:
+            logger.info(f"デジタル顕微鏡（制御ポート {microscope_port}）を初期化中...")
+            from src.devices.microscope import UM22SerialController
+
+            serial_ctl = UM22SerialController(port=microscope_port)
+            if not serial_ctl.connect():
+                logger.error(f"デジタル顕微鏡の制御ポート {microscope_port} に接続できません")
+                self._release_quietly(serial_ctl)
+                return False
+            self.microscope_serial = serial_ctl
+            logger.info(f"✓ デジタル顕微鏡 制御ポート接続完了 ({microscope_port}, {serial_ctl.get_model()})")
+            return True
+
+        except Exception as e:
+            logger.error(f"デジタル顕微鏡（制御ポート）初期化エラー: {e}")
+            return False
+
+    @staticmethod
+    def _release_quietly(device) -> None:
+        """初期化に失敗したデバイスのハンドルをベストエフォートで閉じる"""
+        for name in ("disconnect", "close"):
+            fn = getattr(device, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                return
 
     # ========================================
     # 電子天秤操作
@@ -342,7 +374,7 @@ class SharedDevices:
         Raises:
             RuntimeError: 顕微鏡の制御ポート (microscope_port) が設定・接続されていない場合
         """
-        if not self.use_microscope or self.microscope_serial is None:
+        if not self.use_microscope_serial or self.microscope_serial is None:
             raise RuntimeError(
                 "顕微鏡の制御ポートが初期化されていません "
                 "(config.yaml の shared_devices.microscope_port を設定してください)"
@@ -375,7 +407,7 @@ class SharedDevices:
         Raises:
             RuntimeError: 顕微鏡の制御ポートが初期化されていない場合
         """
-        if not self.use_microscope or self.microscope_serial is None:
+        if not self.use_microscope_serial or self.microscope_serial is None:
             raise RuntimeError(
                 "顕微鏡の制御ポートが初期化されていません "
                 "(config.yaml の shared_devices.microscope_port を設定してください)"
@@ -384,6 +416,8 @@ class SharedDevices:
             raise ValueError(f"unknown focus mode: {mode!r}")
         if mode == "position" and position is None:
             raise ValueError("mode='position' には position が必要です")
+        if mode == "auto" and self.microscope is None:
+            raise RuntimeError("AF には顕微鏡カメラの映像が必要です（use_microscope=True で初期化してください）")
         scope = self.microscope_serial
 
         def _run():
@@ -391,19 +425,28 @@ class SharedDevices:
                 return scope.autofocus(timeout_s=timeout)
             if mode == "position":
                 return scope.goto_position(position, timeout_s=timeout)
-            pos = scope.step_focus(direction, steps)
-            return pos, pos is not None
+            return scope.step_focus(direction, steps, timeout_s=timeout)
 
-        try:
-            # AF の評価値は映像パイプラインが動いているときだけ更新されるので、
-            # モーターが動いている間はカメラからフレームを読み続ける
-            with self._pump_microscope_frames():
-                pos, ok = await asyncio.to_thread(_run)
-            await asyncio.sleep(0.2)
-            return {"focus_position": pos, "focus_converged": bool(ok)}
-        except Exception as e:
-            logger.error(f"顕微鏡フォーカス制御エラー: {e}")
-            raise
+        # AF の評価値は映像パイプラインが動いているときだけ更新されるので、
+        # モーターが動いている間はカメラからフレームを読み続ける。
+        # キャンセル（Ctrl+C 等）時はワーカーに停止を要求し、モーターが止まって
+        # ワーカーが終わるまで待ってからポンプを止める（ポートを閉じる前に必ず終える）。
+        with self._pump_microscope_frames():
+            worker = asyncio.ensure_future(asyncio.to_thread(_run))
+            try:
+                pos, ok = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                scope.request_stop()
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker), timeout=max(15.0, timeout))
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                logger.error(f"顕微鏡フォーカス制御エラー: {e}")
+                raise
+        await asyncio.sleep(0.2)
+        return {"focus_position": pos, "focus_converged": bool(ok)}
 
     def _pump_microscope_frames(self, interval_s: float = 0.1):
         """顕微鏡カメラのフレームを背景スレッドで読み続けるコンテキストマネージャ"""
@@ -435,7 +478,10 @@ class SharedDevices:
             def __exit__(self_, *exc):
                 self_.stop.set()
                 if self_.thread is not None:
-                    self_.thread.join(timeout=2.0)
+                    self_.thread.join(timeout=10.0)
+                    if self_.thread.is_alive():
+                        logger.warning("顕微鏡フレームポンプのスレッドが 10 秒以内に終了しません "
+                                       "(カメラの read() がブロックしています)")
                 logger.debug(f"顕微鏡フレームポンプ終了: {self_.frames} frames")
                 return False
 

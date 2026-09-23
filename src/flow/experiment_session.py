@@ -61,12 +61,14 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     )
 
 
-def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False):
+def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
+                           use_microscope_serial=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
         use_camera=use_camera,
         use_microscope=use_microscope,
+        use_microscope_serial=use_microscope_serial,
         scale_port=config["scale_port"],
         camera_index=config["camera_index"],
         microscope_index=config.get("microscope_index", 2),
@@ -75,10 +77,12 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
     )
 
 
-def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False):
+def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
+                        use_microscope_serial=False):
     """MockSharedDevices を生成するファクトリ"""
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
-                             use_microscope=use_microscope)
+                             use_microscope=use_microscope,
+                             use_microscope_serial=use_microscope_serial)
 
 
 class ExperimentSession:
@@ -173,10 +177,11 @@ class ExperimentSession:
         return robot
 
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
-                         use_microscope: bool = False):
+                         use_microscope: bool = False, use_microscope_serial: bool = False):
         """設定の値で共有デバイスを生成・初期化して登録する"""
         shared = self.shared_factory(
             use_scale=use_scale, use_camera=use_camera, use_microscope=use_microscope,
+            use_microscope_serial=use_microscope_serial,
             config=self.shared_config(),
         )
         if not await shared.initialize():

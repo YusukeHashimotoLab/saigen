@@ -39,6 +39,7 @@ LED 照明の ON/OFF・明るさ、ズーム、オートフォーカスはこの
 """
 
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -96,6 +97,10 @@ class UM22SerialController:
         self.timeout = timeout
         self.reply_wait = reply_wait
         self.ser = None
+        #: 進行中のモーター操作（autofocus / goto_position / step_focus）への停止要求。
+        #: 別スレッドから request_stop() でセットすると、次のポーリングで
+        #: モーターを止めて (位置, False) を返す
+        self._stop_requested = threading.Event()
 
     # ------------------------------------------------------------------
     # 接続
@@ -127,7 +132,7 @@ class UM22SerialController:
             return True
         except Exception as e:
             logger.error(f"顕微鏡 MCU 接続エラー ({self.port}): {e}")
-            self.ser = None
+            self.disconnect()          # 開きかけのハンドルを残さない
             return False
 
     def disconnect(self):
@@ -300,24 +305,54 @@ class UM22SerialController:
             return None
         return bool(status & STATUS_MOTOR_BUSY_BIT)
 
+    #: 連続してこの回数、位置か状態が読めなければ通信断とみなす
+    MAX_FAILED_POLLS = 6
+
+    def request_stop(self) -> None:
+        """進行中のモーター操作を止めるよう要求する（別スレッドから呼んでよい）"""
+        self._stop_requested.set()
+
+    def stop_motor(self) -> None:
+        """ベストエフォートでモーターを止める（手動モードに戻す）。例外は握りつぶす"""
+        try:
+            self.set_focus_mode("manual")
+        except Exception as e:
+            logger.warning(f"顕微鏡モーターの停止コマンド送信に失敗: {e}")
+
     def wait_motor(self, timeout_s: float = 60.0, interval_s: float = 0.5,
                    settle_polls: int = 3) -> tuple:
         """モーターが止まるまで待つ。
 
         「動作中ビットが立っていない」かつ「位置が settle_polls 回連続で同じ」を
-        停止とみなす。
+        停止とみなす。位置や状態が読めなかったポーリングは停止判定に数えず、
+        MAX_FAILED_POLLS 回連続で読めなければ ConnectionError を送出する。
+        request_stop() が呼ばれていれば、その時点で (位置, False) を返す。
 
         Returns:
-            (position, stopped): 最後に読んだ位置と、timeout 内に止まったかどうか
+            (position, stopped): 最後に読めた位置と、timeout 内に止まったかどうか
+
+        Raises:
+            ConnectionError: MCU から位置・状態が連続して読めない
         """
         deadline = time.monotonic() + timeout_s
         last = self.get_motor_position()
         same = 0
+        failed = 0 if last is not None else 1
         while time.monotonic() < deadline:
+            if self._stop_requested.is_set():
+                return last, False
             time.sleep(interval_s)
             pos = self.get_motor_position()
             busy = self.motor_is_busy()
-            same = same + 1 if (pos == last and not busy) else 0
+            if pos is None or busy is None:
+                failed += 1
+                same = 0
+                if failed >= self.MAX_FAILED_POLLS:
+                    raise ConnectionError(
+                        f"顕微鏡 MCU ({self.port}) からモーター位置/状態が {failed} 回連続で読めません")
+                continue
+            failed = 0
+            same = same + 1 if (pos == last and busy is False) else 0
             last = pos
             if same >= settle_polls:
                 return last, True
@@ -338,13 +373,20 @@ class UM22SerialController:
         Returns:
             (position, converged)
         """
+        self._stop_requested.clear()
         self.set_focus_mode("auto")
         time.sleep(0.5)
-        pos, stopped = self.wait_motor(timeout_s)
+        try:
+            pos, stopped = self.wait_motor(timeout_s)
+        except BaseException:
+            self.stop_motor()          # 通信断や割り込みでも探索を続けさせない
+            raise
         if not stopped:
-            logger.warning(f"顕微鏡 AF が {timeout_s:.0f}s 以内に収束しません（位置 {pos}）。手動モードに戻します")
+            why = "停止要求" if self._stop_requested.is_set() else f"{timeout_s:.0f}s 以内に収束しません"
+            logger.warning(f"顕微鏡 AF: {why}（位置 {pos}）。手動モードに戻します")
             self.set_focus_mode("manual")
             time.sleep(0.5)
+            self._stop_requested.clear()
             pos, _ = self.wait_motor(10.0)
             return pos, False
         logger.info(f"✓ 顕微鏡 AF 完了: レンズ位置 {pos}")
@@ -363,9 +405,18 @@ class UM22SerialController:
         time.sleep(0.02)
         self.write(ADDR_TARGET_POS_LO, 0, position & 0xFF)
         time.sleep(0.02)
+        self._stop_requested.clear()
         self.write(1, KEY_BUTTON, CMD_GOTO_POSITION)
         time.sleep(0.3)
-        pos, stopped = self.wait_motor(timeout_s)
+        try:
+            pos, stopped = self.wait_motor(timeout_s)
+        except BaseException:
+            self.stop_motor()
+            raise
+        if not stopped and self._stop_requested.is_set():
+            self.stop_motor()
+            self._stop_requested.clear()
+            pos, _ = self.wait_motor(10.0)
         reached = stopped and pos == position
         if reached:
             logger.info(f"✓ 顕微鏡レンズ位置 {pos}")
@@ -373,22 +424,39 @@ class UM22SerialController:
             logger.warning(f"顕微鏡レンズ位置: 要求 {position}, 到達 {pos} (stopped={stopped})")
         return pos, reached
 
-    def step_focus(self, direction: str = "in", steps: int = 1, hold_s: float = 0.3) -> Optional[int]:
-        """ステップ移動を steps 回行う（ボタンを hold_s 秒押して離す）。最終位置を返す。
+    def step_focus(self, direction: str = "in", steps: int = 1, hold_s: float = 0.3,
+                   timeout_s: float = 60.0) -> tuple:
+        """ステップ移動を steps 回行う（ボタンを hold_s 秒押して離す）。
 
         実機観測: "out" で位置の値が増え、"in" で減る（hold_s=0.3 で 1 押し ≈ 6〜14）。
+        「離す」コマンドは例外時にも必ず送る。timeout_s は押下ループと停止待ちの
+        合計に対する上限で、超えたら残りの押下をやめる。
+
+        Returns:
+            (position, completed): 最終位置と、全ステップを送って停止を確認できたか
         """
         if direction not in ("in", "out"):
             raise ValueError(f"direction must be 'in' or 'out', got {direction!r}")
         press = CMD_ZOOM_IN_STEP if direction == "in" else CMD_ZOOM_OUT_STEP
+        deadline = time.monotonic() + timeout_s
+        self._stop_requested.clear()
+        done = 0
         for _ in range(max(1, int(steps))):
+            if time.monotonic() >= deadline or self._stop_requested.is_set():
+                break
             self.write(1, KEY_BUTTON, press)
-            time.sleep(hold_s)
-            self.write(1, KEY_RELEASE, press)
+            try:
+                time.sleep(hold_s)
+            finally:
+                self.write(1, KEY_RELEASE, press)
+            done += 1
             time.sleep(0.2)
-        pos, _ = self.wait_motor(10.0)
-        logger.info(f"✓ 顕微鏡フォーカス ステップ {direction} x{steps}: レンズ位置 {pos}")
-        return pos
+        remaining = max(1.0, deadline - time.monotonic())
+        pos, stopped = self.wait_motor(min(10.0, remaining))
+        completed = stopped and done == max(1, int(steps))
+        logger.info(f"✓ 顕微鏡フォーカス ステップ {direction} x{done}/{steps}: レンズ位置 {pos}"
+                    + ("" if completed else " (未完了)"))
+        return pos, completed
 
     def reset_mcu(self, wait_s: float = 8.0) -> str:
         """RTS パルスで MCU をリセットする。**カメラも電源が入れ直される**ので、
@@ -427,3 +495,5 @@ if __name__ == "__main__":
             print("autofocus ->", scope.autofocus(timeout_s=60))
         elif len(sys.argv) > 3 and sys.argv[2] == "goto":
             print("goto ->", scope.goto_position(int(sys.argv[3])))
+        elif len(sys.argv) > 2 and sys.argv[2] in ("in", "out"):
+            print("step ->", scope.step_focus(sys.argv[2], steps=int(sys.argv[3]) if len(sys.argv) > 3 else 1))
