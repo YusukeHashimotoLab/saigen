@@ -21,6 +21,10 @@ LTR390 left in ALS mode, in which the UVS data registers never update, so their
 UVS mode and ``uvi`` carries a UV index (float). The CSV column name is
 unchanged, so old files stay parseable — only the semantics changed.
 
+Note on humidity: before 2026-09-23 the BME280 humidity was divided by 1024
+twice, so older recordings hold 0-0.098 instead of 0-100 %RH (multiply by 1024
+to recover it, to a resolution of 1 %RH). See ``compensate_humidity``.
+
 Dependencies are kept minimal on purpose (the Pi Zero has limited resources and
 this script should run with nothing beyond the Python standard library plus
 ``smbus``/``smbus2``): no PyYAML, no third-party sensor drivers.
@@ -62,6 +66,38 @@ except ImportError:
         import smbus2 as smbus
     except ImportError:
         print("[!] Error: smbus or smbus2 library not found. Install with: sudo apt install python3-smbus")
+
+
+def compensate_temperature(adc_t, dig_T1, dig_T2, dig_T3):
+    """Bosch BME280 integer temperature compensation (datasheet 4.2.3).
+
+    Returns ``(t_fine, temp)`` where ``temp`` is in 0.01 degC (5123 = 51.23 degC)
+    and ``t_fine`` is the fine-resolution value the humidity formula needs.
+    Pure integer math, no I/O, so it can be unit-tested without ``smbus``.
+    """
+    v1 = ((((adc_t >> 3) - (dig_T1 << 1))) * (dig_T2)) >> 11
+    v2 = (((((adc_t >> 4) - (dig_T1)) * ((adc_t >> 4) - (dig_T1))) >> 12) * (dig_T3)) >> 14
+    t_fine = v1 + v2
+    temp = (t_fine * 5 + 128) >> 8
+    return t_fine, temp
+
+
+def compensate_humidity(adc_h, t_fine, dig_H1, dig_H2, dig_H3, dig_H4, dig_H5, dig_H6):
+    """Bosch BME280 integer humidity compensation (datasheet 4.2.3), in %RH.
+
+    The reference ``bme280_compensate_H_int32`` returns ``v_x1_u32r >> 12``, an
+    unsigned Q22.10 value (47445 = 47445/1024 = 46.333 %RH), so %RH is that
+    value divided by 1024. The clamp 419430400 = 100 * 2**22 is 100 %RH before
+    the final shift. Before 2026-09-23 this code shifted by 22 (already whole
+    %RH) and then also divided by 1024, recording 0-0.098 instead of 0-100.
+    """
+    vh = t_fine - 76800
+    vh = (((((adc_h << 14) - (dig_H4 << 20) - (dig_H5 * vh)) + 16384) >> 15) *
+          (((((((vh * dig_H6) >> 10) * (((vh * dig_H3) >> 11) + 32768)) >> 10) + 2097152) * dig_H2 + 8192) >> 14))
+    vh = vh - (((((vh >> 15) * (vh >> 15)) >> 7) * dig_H1) >> 4)
+    vh = 0 if vh < 0 else vh
+    vh = 419430400 if vh > 419430400 else vh
+    return (vh >> 12) / 1024.0
 
 
 class BME280:
@@ -115,10 +151,7 @@ class BME280:
             dig_T2 = struct.unpack("<h", bytes(self.calib[2:4]))[0]
             dig_T3 = struct.unpack("<h", bytes(self.calib[4:6]))[0]
 
-            v1 = ((((adc_t >> 3) - (dig_T1 << 1))) * (dig_T2)) >> 11
-            v2 = (((((adc_t >> 4) - (dig_T1)) * ((adc_t >> 4) - (dig_T1))) >> 12) * (dig_T3)) >> 14
-            t_fine = v1 + v2
-            temp = (t_fine * 5 + 128) >> 8
+            t_fine, temp = compensate_temperature(adc_t, dig_T1, dig_T2, dig_T3)
 
             # --- Humidity ---
             humi = 0.0
@@ -132,14 +165,9 @@ class BME280:
                     dig_H5 = (self.calib[30] << 4) | (self.calib[29] >> 4)
                     dig_H6 = struct.unpack("<b", bytes([self.calib[31]]))[0]
 
-                    vh = t_fine - 76800
-                    vh = (((((adc_h << 14) - (dig_H4 << 20) - (dig_H5 * vh)) + 16384) >> 15) *
-                          (((((((vh * dig_H6) >> 10) * (((vh * dig_H3) >> 11) + 32768)) >> 10) + 2097152) * dig_H2 + 8192) >> 14))
-                    vh = vh - (((((vh >> 15) * (vh >> 15)) >> 7) * dig_H1) >> 4)
-                    vh = 0 if vh < 0 else vh
-                    vh = 419430400 if vh > 419430400 else vh
-                    humi = vh >> 22
-                    humi = humi / 1024.0
+                    humi = compensate_humidity(
+                        adc_h, t_fine, dig_H1, dig_H2, dig_H3, dig_H4, dig_H5, dig_H6
+                    )
 
             return temp / 100.0, humi
         except:

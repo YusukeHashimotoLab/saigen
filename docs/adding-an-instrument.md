@@ -88,9 +88,13 @@ what tests, CI and `--mock` use to check that the value reaches the log.
 - Add a branch in `execute_shared_device_step()` that reads the parameters from
   either a dict or the model (both forms reach it), calls the wrapper and
   returns `{"voltage": value}`.
-- In `execute_workflow()`, derive `needs_dmm` from the actions present in the
-  flow, next to `needs_scale` and `needs_camera`, and pass `use_dmm=needs_dmm`
-  to `SharedDevices`. This is what lets a flow that never measures voltage run
+- In `plan_resources()` (`src/flow/run_flow.py`), derive `needs_dmm` from the
+  actions present in the flow, next to `needs_scale` and `needs_camera`, return
+  it with the other flags, and pass `use_dmm=needs_dmm` through
+  `ExperimentSession.add_shared()` (`src/flow/experiment_session.py`, whose
+  shared-device factories forward it to `SharedDevices` / `MockSharedDevices`).
+  The CSV runner and the GUI runner unpack the same tuple, so update those two
+  call sites as well. This is what lets a flow that never measures voltage run
   on a cell without a DMM.
 
 `src/flow/experiment_logger.py`

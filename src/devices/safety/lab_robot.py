@@ -17,7 +17,11 @@ import math
 import time
 from typing import Optional, List, Dict, Any
 
-from src.devices.safety.validators import WorkspaceValidator, WorkspaceViolationError
+from src.devices.safety.validators import (
+    ValidationError,
+    WorkspaceValidator,
+    WorkspaceViolationError,
+)
 
 # ロギング設定
 logger = logging.getLogger(__name__)
@@ -306,9 +310,13 @@ class LabRobot:
             await asyncio.sleep(self.wait_after_angle_move)
             logger.info(f"✓ Dobot: {angle}度回転完了")
 
+        except ValidationError:
+            # 可動域違反: 移動コマンドは送信されておらずアームは動いていない。
+            # 復帰動作は不要なので、未検証の go_home をさせずにそのまま送出する
+            raise
         except Exception as e:
             logger.error(f"回転エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
 
     # 回転速度マッピング（low/normal/high → DobotConfigプリセット名）
@@ -354,9 +362,13 @@ class LabRobot:
             await asyncio.sleep(self.wait_after_angle_move)
             logger.info(f"✓ Dobot: {delta_angle:+.1f}°回転完了（現在: {target_angle:.1f}°）")
 
+        except ValidationError:
+            # 可動域違反: 移動コマンドは送信されておらずアームは動いていない。
+            # 復帰動作は不要なので、未検証の go_home をさせずにそのまま送出する
+            raise
         except Exception as e:
             logger.error(f"相対回転エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
         finally:
             # プリセットを元に戻す
@@ -394,9 +406,13 @@ class LabRobot:
             await asyncio.sleep(self.wait_after_z_move)
             logger.info(f"✓ Dobot: Z軸移動完了")
 
+        except ValidationError:
+            # 可動域違反: 移動コマンドは送信されておらずアームは動いていない。
+            # 復帰動作は不要なので、未検証の go_home をさせずにそのまま送出する
+            raise
         except Exception as e:
             logger.error(f"Z軸移動エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
 
     async def move_xyz(self, x: float, y: float, z: float):
@@ -426,9 +442,13 @@ class LabRobot:
             await asyncio.sleep(self.wait_after_xy_move)
             logger.info(f"✓ Dobot: XYZ移動完了")
 
+        except ValidationError:
+            # 可動域違反: 移動コマンドは送信されておらずアームは動いていない。
+            # 復帰動作は不要なので、未検証の go_home をさせずにそのまま送出する
+            raise
         except Exception as e:
             logger.error(f"XYZ移動エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
 
     async def move_radial(self, distance: float):
@@ -476,9 +496,13 @@ class LabRobot:
             await asyncio.sleep(self.wait_after_xy_move)
             logger.info(f"✓ Dobot: 半径方向移動完了（r: {r:.1f} -> {r + distance:.1f}mm）")
 
+        except ValidationError:
+            # 可動域違反: 移動コマンドは送信されておらずアームは動いていない。
+            # 復帰動作は不要なので、未検証の go_home をさせずにそのまま送出する
+            raise
         except Exception as e:
             logger.error(f"半径方向移動エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
 
     async def move_slider(self, position: float):
@@ -513,7 +537,7 @@ class LabRobot:
 
         except Exception as e:
             logger.error(f"スライダー移動エラー: {e}")
-            await self.go_home()
+            await self._recover_home()
             raise
 
     async def move_conveyer(self, index: int, speed: float, duration: float):
@@ -772,9 +796,48 @@ class LabRobot:
         self._current_pipette_volume = volume
         logger.info(f"ピペットボリュームをリセット: {old_volume:.2f}mL → {volume:.2f}mL")
 
+    async def _recover_home(self):
+        """移動失敗後のベストエフォートなホーム復帰（元の例外を隠さない）
+
+        go_home() 自体の失敗（可動域違反による拒否を含む）はログに残して握りつぶし、
+        呼び出し側で元の例外を再送出させる。中断（CancelledError /
+        KeyboardInterrupt）はそのまま伝播させる。
+        """
+        try:
+            await self.go_home()
+        except Exception as e:
+            logger.error(f"エラー後のホーム復帰を実行できませんでした: {e}")
+
+    def _validate_home_legs(self, current_pose):
+        """go_home() が送る各移動（Z上昇・Joint1回転・XYZ移動）を事前検証する
+
+        いずれかが可動域外なら WorkspaceViolationError を送出する。
+        全区間を先に検証するため、途中まで動いてから拒否されることはない。
+
+        Returns:
+            float or None: Z上昇量（上昇不要なら None）
+        """
+        home = self.home_position
+        z_diff = None
+        if current_pose[2] < home[2] - 0.1:
+            z_diff = home[2] - current_pose[2]
+        if self.workspace_validator:
+            if z_diff is not None:
+                self.workspace_validator.validate_z_relative(current_pose[2], z_diff)
+            if len(home) >= 4:
+                self.workspace_validator.validate_joint1(home[3])
+            self.workspace_validator.validate_xyz(home[0], home[1], home[2])
+        return z_diff
+
     async def go_home(self):
         """
         ホームポジションへ安全に復帰（Z軸 → Joint1角度 → XY座標の順）
+
+        各区間（Z上昇・Joint1回転・XYZ移動）は、最初のコマンドを送る前に
+        すべて可動域バリデータで検証する。
+
+        Raises:
+            WorkspaceViolationError: いずれかの区間が可動域外の場合（アームは動かない）
         """
         if self.dobot is None:
             logger.warning("Dobotが初期化されていないため、ホーム復帰をスキップします")
@@ -790,10 +853,16 @@ class LabRobot:
             # 現在位置を取得
             current_pose = self.dobot.get_current_position()
 
+            # 全区間を事前検証（可動域外なら何も動かさずに送出）
+            try:
+                z_diff = self._validate_home_legs(current_pose)
+            except ValidationError as e:
+                logger.error(f"ホーム復帰を拒否しました（可動域外）: {e}")
+                raise
+
             # ステップ1: Z軸がホーム位置より低い場合のみ上昇（衝突回避）
             # 現在Zがホームより高い場合は下降させない（障害物回避のため、ステップ3で調整）
-            if current_pose[2] < self.home_position[2] - 0.1:
-                z_diff = self.home_position[2] - current_pose[2]
+            if z_diff is not None:
                 logger.info(f"Z軸をホーム位置 {self.home_position[2]:.1f} まで上昇中...")
                 self.dobot.move_Z(z_diff)
                 await asyncio.sleep(self.wait_after_z_move)
@@ -815,6 +884,8 @@ class LabRobot:
 
             logger.info("✓ Dobot: ホームポジション復帰完了")
 
+        except ValidationError:
+            raise
         except Exception as e:
             logger.error(f"ホーム復帰エラー: {e}")
             raise
@@ -874,6 +945,12 @@ class LabRobot:
             # ホームポジションを更新（X, Y, Z, J1角度）
             self.home_position = [current_pos[0], current_pos[1], current_pos[2], current_pos[4]]
 
+            # 取得したホームを可動域で検証する。可動域外なら黙って受け入れず警告し、
+            # go_home() はこのホームへの移動を拒否する（_validate_home_legs）。
+            # 可動域外の位置はファームウェアのホーム（set_home_params）にも書き込まない。
+            if not self.home_is_within_limits():
+                return self.home_position
+
             # PyDobotControllerのset_home_paramsを呼び出し
             self.dobot.set_home_params(
                 self.home_position[0],
@@ -889,6 +966,27 @@ class LabRobot:
         except Exception as e:
             logger.error(f"ホームポジション設定エラー: {e}")
             raise
+
+    def home_is_within_limits(self) -> bool:
+        """現在のホームポジションが可動域内か検証する（可動域外なら警告を出す）
+
+        バリデータ未設定・ホーム未設定の場合は True を返す。
+        """
+        if self.workspace_validator is None or self.home_position is None:
+            return True
+        home = self.home_position
+        try:
+            self.workspace_validator.validate_xyz(home[0], home[1], home[2])
+            if len(home) >= 4:
+                self.workspace_validator.validate_joint1(home[3])
+        except ValidationError as e:
+            logger.warning(
+                "警告: ホームとして取得した現在位置が config.yaml の workspace 可動域外です。"
+                "go_home() はこのホームへの移動を拒否します。アームを可動域内へ手動で"
+                f"移動してから再初期化してください。\n{e}"
+            )
+            return False
+        return True
 
     def emergency_stop(self):
         """全デバイスを可能な範囲で即時停止する（緊急停止）。
@@ -923,39 +1021,39 @@ class LabRobot:
         logger.warning("=== 緊急停止処理完了 ===")
 
     async def cleanup(self):
-        """全デバイスを安全に切断"""
+        """全デバイスを安全に切断
+
+        1台の切断失敗や切断中の中断（CancelledError / KeyboardInterrupt）で
+        残りのデバイスの切断が飛ばされないよう、デバイスごとに BaseException を
+        捕捉して続行する。中断はすべての切断を試みた後に再送出する。
+        """
         logger.info("=== LabRobot デバイス切断開始 ===")
+        interrupted = None
 
-        # Dobotの切断
-        try:
-            if self.dobot:
-                self.dobot.disconnect()
-                logger.info("✓ Dobot切断完了")
-        except Exception as e:
-            logger.error(f"Dobot切断エラー: {e}")
-
-        try:
-            if self.picus2:
-                await self.picus2.disconnect()
-                logger.info("✓ Picus2切断完了")
-        except Exception as e:
-            logger.error(f"Picus2切断エラー: {e}")
-
-        try:
-            if self.ika:
-                self.ika.disconnect()
-                logger.info("✓ IKA切断完了")
-        except Exception as e:
-            logger.error(f"IKA切断エラー: {e}")
-
-        try:
-            if self.powder_dispenser:
-                self.powder_dispenser.disconnect()
-                logger.info("✓ 粉体排出装置切断完了")
-        except Exception as e:
-            logger.error(f"粉体排出装置切断エラー: {e}")
+        for name, device, is_async in (
+            ("Dobot", self.dobot, False),
+            ("Picus2", self.picus2, True),
+            ("IKA", self.ika, False),
+            ("粉体排出装置", self.powder_dispenser, False),
+        ):
+            if not device:
+                continue
+            try:
+                if is_async:
+                    await device.disconnect()
+                else:
+                    device.disconnect()
+                logger.info(f"✓ {name}切断完了")
+            except Exception as e:
+                logger.error(f"{name}切断エラー: {e}")
+            except BaseException as e:  # 中断されても残りの切断は続ける
+                logger.error(f"{name}切断中に中断されました: {e!r}")
+                if interrupted is None:
+                    interrupted = e
 
         logger.info("=== LabRobot 全デバイス切断完了 ===")
+        if interrupted is not None:
+            raise interrupted
 
     async def __aenter__(self):
         """非同期コンテキストマネージャ: 入口"""

@@ -5,7 +5,7 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
     # 実機なしで動作確認（Mock モード。録画は常に無効）
     python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --mock
 
-    # スキーマ検証とループ展開だけ行う
+    # スキーマ検証・ループ展開・絶対目標の可動域チェックだけ行う（デバイスは開かない）
     python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --validate-only
 
     # 実機で実行（ポートは config.yaml / .env / 引数で指定）
@@ -17,6 +17,10 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
 処理の流れ:
     1. JSON を読み込み、Pydantic スキーマ（schema.py）で検証する
     2. loop_start / loop_end を展開してフラットなステップ列にする
+    2.5 プリフライト: 絶対目標（move_xyz / rotate）を可動域バリデータで検査する。
+       違反があればデバイスを開く前に中止する（--validate-only でも同じ）。
+       相対移動（move_z / rotate_relative / move_radial）は開始姿勢に依存するため
+       ここでは検査できず、--mock / 実機実行時に 1 手ごとに検査される
     3. 実行ごとのログフォルダを作る（logs/<日付>/<フロー名>_<時刻>/）
     4. ExperimentSession の安全枠（初期化 → 実行 → 中断時は緊急停止 /
        エラー時はホーム復帰 → 切断）の中でステップを順に実行する
@@ -35,7 +39,8 @@ import os
 import subprocess
 import sys
 import time
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.error import URLError
 
@@ -47,7 +52,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from src import config as lab_config
-from src.devices.safety.validators import default_workspace_validator
+from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
@@ -59,6 +64,8 @@ logger = logging.getLogger("run_flow")
 
 PICUS2_ACTIONS = {"aspirate", "dispense", "blow_out"}
 LOOP_ACTIONS = {"loop_start", "loop_end"}
+# 開始姿勢に依存し、実行前には目標位置が決まらない相対移動
+RELATIVE_MOVE_ACTIONS = {"move_z", "rotate_relative", "move_radial"}
 LOGS_DIR = os.path.join(_REPO_ROOT, "logs")
 DASHBOARD_SCRIPT = os.path.join(
     _REPO_ROOT, "src", "monitoring", "dashboard", "launch_sensor_dashboard.py"
@@ -186,7 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock", action="store_true",
                    help="実機を使わずログ出力のみで実行する（録画は常に無効）")
     p.add_argument("--validate-only", action="store_true",
-                   help="スキーマ検証とループ展開のみ行い実行しない")
+                   help="スキーマ検証・ループ展開・絶対目標（move_xyz / rotate）の可動域チェックのみ行い、"
+                        "デバイスを開かずに終了する。相対移動は --mock / 実行時に 1 手ごとに検査される")
     # ポートは None を既定にして、環境変数 → config.yaml の順で解決する
     for rid in (1, 2, 3):
         p.add_argument(f"--robot{rid}-dobot", default=None,
@@ -269,6 +277,74 @@ def load_and_validate(path: str) -> Tuple[ExperimentWorkflow, list]:
     return workflow, expanded
 
 
+@dataclass
+class PreflightReport:
+    """実行前の可動域チェックの結果（ステップ番号はループ展開後の 1 始まり）"""
+    checked: int = 0
+    violations: List[Tuple[int, dict, Exception]] = field(default_factory=list)
+    unverified: List[Tuple[int, dict]] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.violations
+
+
+def _step_label(index: int, step: dict) -> str:
+    rid = step.get("robot_id", 1)
+    it = step.get("_iteration")
+    return f"ステップ {index}" + (f"（ループ {it} 回目）" if it else "") + f" Robot {rid} {step.get('action')}"
+
+
+def preflight_workspace(steps: list, validator=None) -> PreflightReport:
+    """展開後のステップの絶対目標を、デバイスを開かずに可動域バリデータで検査する。
+
+    - move_xyz: ``validate_xyz(x, y, z)``
+    - rotate: ``validate_joint1(angle)``
+    - move_z / rotate_relative / move_radial: 開始姿勢が実行前には分からないため
+      検査せず ``unverified`` に入れる（実行時に LabRobot / MockLabRobot が 1 手
+      ごとに検査する）
+
+    NaN / inf もここで違反になる（WorkspaceValidator が拒否する）。
+    """
+    if validator is None:
+        validator = default_workspace_validator()
+    report = PreflightReport()
+    for i, step in enumerate(steps, 1):
+        action = step.get("action")
+        try:
+            if action == "move_xyz":
+                report.checked += 1
+                validator.validate_xyz(step.get("x"), step.get("y"), step.get("z"))
+            elif action == "rotate":
+                report.checked += 1
+                validator.validate_joint1(step.get("angle"))
+            elif action in RELATIVE_MOVE_ACTIONS:
+                report.unverified.append((i, step))
+        except WorkspaceViolationError as e:
+            report.violations.append((i, step, e))
+    return report
+
+
+def log_preflight(report: PreflightReport, validator) -> None:
+    """プリフライト結果をログに出す（違反は ERROR、相対移動は INFO で要約）"""
+    for i, step, err in report.violations:
+        logger.error(f"可動域違反 {_step_label(i, step)} {_fmt_params(step)}\n{err}")
+    if report.violations:
+        logger.error(f"可動域の上下限（config.yaml の workspace）: {validator.get_limits()}")
+
+    if report.unverified:
+        # ループ展開で同じステップが何度も出るので、同一内容ごとにまとめる
+        groups = {}
+        for i, step in report.unverified:
+            key = (step.get("action"), step.get("robot_id", 1),
+                   step.get("distance", step.get("angle")))
+            groups.setdefault(key, []).append(i)
+        for (action, rid, value), idx in groups.items():
+            shown = ", ".join(map(str, idx[:10])) + (" ..." if len(idx) > 10 else "")
+            logger.info(f"unverified until run: Robot {rid} {action} {value} "
+                        f"（{len(idx)} 回, ステップ {shown}）")
+
+
 def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
     """フローが必要とするロボット・共有デバイスを洗い出す。"""
     actions = {s.get("action") for s in steps}
@@ -296,8 +372,27 @@ def _fmt_params(step: dict) -> str:
 
 async def run(args) -> int:
     workflow, steps = load_and_validate(args.flow)
+
+    # プリフライト: どのデバイスも開く前に絶対目標を可動域チェックする
+    validator = default_workspace_validator()
+    report = preflight_workspace(steps, validator)
+    log_preflight(report, validator)
+    if not report.ok:
+        logger.error(f"可動域チェックで {len(report.violations)} 件の違反があります。"
+                     "デバイスを開かずに中止します（ステップと座標は上記）")
+        return 3
+    unverified_note = ""
+    if report.unverified:
+        unverified_note = (f"。相対移動 {len(report.unverified)} 件（move_z / rotate_relative / "
+                           "move_radial）は開始姿勢に依存するため未検証で、--mock / 実行時に "
+                           "1 手ごとに検査されます")
+    checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
+                    else "絶対目標（move_xyz / rotate）なし")
+    logger.info(f"可動域チェック: {checked_note}{unverified_note}")
+
     if args.validate_only:
-        logger.info("検証のみ完了（--validate-only）")
+        logger.info(f"検証のみ完了（--validate-only）: スキーマ・ループ構造・絶対目標の可動域 OK"
+                    f"{unverified_note}")
         return 0
     if not steps:
         logger.error("ステップが空です")
@@ -358,7 +453,7 @@ async def run(args) -> int:
         mock=args.mock,
         robot_ports=robot_ports,
         shared_config=shared_config,
-        workspace_validator=default_workspace_validator(),
+        workspace_validator=validator,
     )
 
     async def body():
@@ -457,6 +552,13 @@ def main(argv=None) -> int:
         return 2
     except json.JSONDecodeError as e:
         logger.error(f"JSON を読み込めません: {e}")
+        return 2
+    except ValueError as e:
+        # ループ構造の誤り（expand_loops）など
+        logger.error(f"フローが不正です: {e}")
+        return 2
+    except lab_config.ConfigError as e:
+        logger.error(f"設定ファイルを使えません（組み込み既定値には戻しません）: {e}")
         return 2
     except KeyboardInterrupt:
         # 緊急停止とクリーンアップは run() 内の ExperimentSession が実施済み

@@ -5,12 +5,43 @@ X, Y, Z座標とJoint1角度の可動域を検証します。
 """
 
 import logging
+import math
 from typing import Dict, Optional, List
 
 from .base import PositionValidator
 from .exceptions import WorkspaceViolationError, ViolationDetail
 
 logger = logging.getLogger(__name__)
+
+
+class NonFiniteTargetError(WorkspaceViolationError, ValueError):
+    """目標値に NaN / inf が含まれる場合の可動域違反。
+
+    NaN は大小比較が常に False になるため、範囲チェックだけでは素通りしてしまう。
+    WorkspaceViolationError と ValueError の両方として捕捉できる。
+    """
+
+    def __str__(self) -> str:
+        pos_str = ", ".join(f"{k}={v}" for k, v in self.target_position.items())
+        axes = ", ".join(v.axis for v in self.violations)
+        return (
+            f"{self.message}\n"
+            f"目標位置: ({pos_str})\n"
+            f"違反内容:\n  - 有限の数値ではない軸: {axes}"
+        )
+
+
+def _non_finite(values: Dict[str, float]) -> List[str]:
+    """有限の実数でない（NaN / inf / 数値でない）キーを返す。"""
+    bad = []
+    for key, value in values.items():
+        try:
+            if not math.isfinite(value):
+                bad.append(key)
+        except TypeError:
+            bad.append(key)
+    return bad
+
 
 
 class WorkspaceValidator(PositionValidator):
@@ -49,6 +80,24 @@ class WorkspaceValidator(PositionValidator):
         joint1_min: float = -135,
         joint1_max: float = 135,
     ):
+        limits = {
+            "x": (x_min, x_max),
+            "y": (y_min, y_max),
+            "z": (z_min, z_max),
+            "joint1": (joint1_min, joint1_max),
+        }
+        for axis, (lo, hi) in limits.items():
+            bad = _non_finite({f"{axis}_min": lo, f"{axis}_max": hi})
+            if bad:
+                raise ValueError(
+                    f"可動域の上下限が有限の数値ではありません: "
+                    f"{axis}_min={lo!r}, {axis}_max={hi!r}"
+                )
+            if lo > hi:
+                raise ValueError(
+                    f"可動域の下限が上限より大きい: {axis}_min={lo} > {axis}_max={hi}"
+                )
+
         self.x_min = x_min
         self.x_max = x_max
         self.y_min = y_min
@@ -77,6 +126,7 @@ class WorkspaceValidator(PositionValidator):
             WorkspaceViolationError: 可動域外の場合
         """
         violations: List[ViolationDetail] = []
+        self._require_finite({"x": x, "y": y, "z": z}, "XYZ座標が有限の数値ではありません (NaN/inf)")
 
         # X軸チェック
         if x < self.x_min or x > self.x_max:
@@ -130,6 +180,7 @@ class WorkspaceValidator(PositionValidator):
         Raises:
             WorkspaceViolationError: 可動域外の場合
         """
+        self._require_finite({"joint1": angle}, "Joint1角度が有限の数値ではありません (NaN/inf)")
         if angle < self.joint1_min or angle > self.joint1_max:
             raise WorkspaceViolationError(
                 message="Joint1角度が可動域外です",
@@ -157,6 +208,7 @@ class WorkspaceValidator(PositionValidator):
         Raises:
             WorkspaceViolationError: 移動後が可動域外の場合
         """
+        self._require_finite({"current_z": current_z, "delta_z": delta_z}, "Z軸相対移動の値が有限の数値ではありません (NaN/inf)")
         target_z = current_z + delta_z
 
         if target_z < self.z_min or target_z > self.z_max:
@@ -186,6 +238,7 @@ class WorkspaceValidator(PositionValidator):
         Raises:
             WorkspaceViolationError: 回転後が可動域外の場合
         """
+        self._require_finite({"current_angle": current_angle, "delta_angle": delta_angle}, "Joint1相対回転の値が有限の数値ではありません (NaN/inf)")
         target_angle = current_angle + delta_angle
 
         if target_angle < self.joint1_min or target_angle > self.joint1_max:
@@ -209,6 +262,21 @@ class WorkspaceValidator(PositionValidator):
         logger.debug(
             f"Joint1相対回転検証OK: {current_angle:.2f}° + {delta_angle:.2f}° = {target_angle:.2f}°"
         )
+
+    @staticmethod
+    def _require_finite(values: Dict[str, float], message: str) -> None:
+        """NaN / inf を含む目標値を拒否する（NaN は範囲比較をすり抜けるため）。"""
+        bad = _non_finite(values)
+        if bad:
+            raise NonFiniteTargetError(
+                message=message,
+                target_position=dict(values),
+                violations=[
+                    ViolationDetail(axis=k, current_value=values[k],
+                                    min_value=float("nan"), max_value=float("nan"))
+                    for k in bad
+                ],
+            )
 
     def get_limits(self) -> Dict[str, Dict[str, float]]:
         """現在の可動域制限を取得"""

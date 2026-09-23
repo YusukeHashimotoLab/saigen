@@ -1,19 +1,13 @@
 import asyncio
-import json
 import logging
 import sys
 import os
 
-# パス解決: リポジトリルートを sys.path に追加（`python src/flow/executor.py` 直接実行用）
+# パス解決: リポジトリルートを sys.path に追加（直接実行時に案内メッセージを出すため）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from src.devices.safety.lab_robot import LabRobot
-from src.devices.safety.shared_devices import SharedDevices
-from src.devices.safety.mock_robot import MockLabRobot
-from src.devices.safety.validators import default_workspace_validator
-from src.flow.schema import ExperimentWorkflow
 
 # ロギング設定
 logging.basicConfig(
@@ -71,6 +65,13 @@ def expand_loops(steps: list) -> list:
                 if inner_action == "loop_end" and inner_id == loop_id:
                     found_end = True
                     break
+                elif inner_action == "loop_end":
+                    # 別 id の loop_end をループ本体に含めると、構造の誤りが
+                    # 黙って「普通のステップ」として展開されてしまう
+                    raise ValueError(
+                        f"loop_start (id={loop_id}) の本体に対応しない loop_end "
+                        f"(id={inner_id}) があります（ステップ {j + 1}）"
+                    )
                 elif inner_action == "loop_start":
                     # ネストループは現在非対応
                     raise ValueError(f"ネストされたループは現在サポートされていません（loop_id: {loop_id}）")
@@ -172,8 +173,9 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         return None
 
     else:
-        logger.warning(f"不明な共有デバイスアクション: {action}")
-        return None
+        # 未知のアクションを警告だけで読み飛ばすと、後続ステップが想定外の
+        # 状態で実行される。実行を止める。
+        raise ValueError(f"不明な共有デバイスアクション: {action!r}")
 
 
 async def execute_robot_step(step, robots, logger=None):
@@ -263,7 +265,7 @@ async def execute_robot_step(step, robots, logger=None):
         await robot.move_conveyer(index, speed, duration)
 
     else:
-        logger.warning(f"不明なアクション: {action}")
+        raise ValueError(f"不明なアクション: {action!r}")
 
 
 async def execute_step(step, robots, shared_devices=None, logger=None):
@@ -296,111 +298,31 @@ async def execute_step(step, robots, shared_devices=None, logger=None):
 
 
 async def execute_workflow(json_path: str, robot_settings: dict = None, shared_settings: dict = None):
+    """廃止: 使わないこと。
+
+    旧実装は ExperimentSession の安全枠を通らずに実機を開き、ループを展開せず、
+    全ステップを robot_id に関係なく 1 台のアームへ送っていた。Mock の選択肢も
+    無かった。フローの実行は run_flow を使う::
+
+        python -m src.flow.run_flow <flow.json> --validate-only
+        python -m src.flow.run_flow <flow.json> --mock
+
+    Raises:
+        NotImplementedError: 常に
     """
-    JSONワークフローを読み込んで実行する
-
-    Args:
-        json_path: 実行するJSONファイルのパス
-        robot_settings: LabRobotに渡す設定辞書 (portなど)
-        shared_settings: SharedDevicesに渡す設定辞書 (scale_port, camera_indexなど)
-    """
-    logger = _default_logger
-
-    if robot_settings is None:
-        robot_settings = {}
-    if shared_settings is None:
-        shared_settings = {}
-
-    # 可動域バリデータを配線（呼び出し側が明示指定していればそれを尊重）
-    robot_settings.setdefault("workspace_validator", default_workspace_validator())
-
-    # 1. JSON読み込み
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-        logger.info(f"JSONファイル読み込み完了: {json_path}")
-    except FileNotFoundError:
-        logger.error(f"ファイルが見つかりません: {json_path}")
-        return
-    except json.JSONDecodeError:
-        logger.error(f"JSONフォーマットエラー: {json_path}")
-        return
-
-    # 2. スキーマバリデーション & パース
-    # ここで schema.py の定義と照らし合わせ、不整合があれば即エラーになります
-    try:
-        workflow = ExperimentWorkflow(**json_data)  # 型検証しworkflow変数に格納
-        logger.info(f"ワークフロー解析成功: {workflow.name}")
-        logger.info(f"説明: {workflow.description}")
-        logger.info(f"ステップ数: {len(workflow.steps)}")
-    except Exception as e:
-        logger.error(f"ワークフロー定義エラー (Schema Validation Failed):\n{e}")
-        return
-
-    # 3. ワークフローから必要なデバイスを判定
-    actions_in_workflow = {step.action for step in workflow.steps}
-    needs_shared_devices = bool(actions_in_workflow & SHARED_DEVICE_ACTIONS)
-    needs_scale = "measure_weight" in actions_in_workflow or "tare_scale" in actions_in_workflow
-    needs_camera = "capture_and_save" in actions_in_workflow
-    needs_microscope = bool(actions_in_workflow & MICROSCOPE_CAMERA_ACTIONS)
-    needs_microscope_serial = bool(actions_in_workflow & MICROSCOPE_SERIAL_ACTIONS)
-
-    # 4. LabRobot初期化 & 実行ループ
-    async with LabRobot(use_dobot=True, **robot_settings) as robot:
-        # 共有デバイスの初期化（必要な場合のみ）
-        shared_devices = None
-        if needs_shared_devices:
-            shared_devices = SharedDevices(
-                use_scale=needs_scale,
-                use_camera=needs_camera,
-                use_microscope=needs_microscope,
-                use_microscope_serial=needs_microscope_serial,
-                **shared_settings
-            )
-            if not await shared_devices.initialize():
-                logger.error("SharedDevicesの初期化に失敗しました")
-                return
-
-        try:
-            # ホームポジションの設定（今回は現在位置をホームとする）
-            # ※実運用ではJSON内で指定するか、固定値を使うことを推奨
-            logger.info("安全のため、現在の位置をホームポジションとして設定します...")
-            robot.set_current_position_as_home()
-
-            logger.info("=== 実験ワークフロー開始 ===")
-
-            for i, step in enumerate(workflow.steps, 1):
-                logger.info(f"Step {i}/{len(workflow.steps)}: {step.action}")
-                await execute_step(step, robot, shared_devices, logger)
-
-            logger.info("=== 実験ワークフロー完了 ===")
-
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            # Ctrl+C / キャンセル時は緊急停止（その場で止め、追加動作はさせない）
-            logger.warning("中断要求を受信しました。緊急停止します...")
-            robot.emergency_stop()
-            raise
-
-        finally:
-            # 共有デバイスのクリーンアップ
-            if shared_devices is not None:
-                await shared_devices.cleanup()
+    raise NotImplementedError(
+        "execute_workflow() は廃止されました。"
+        "`python -m src.flow.run_flow <flow.json> --mock`（実機は --mock なし）を使ってください。"
+    )
 
 
-# ==========================================
-# 動作確認用メインルーチン
-# ==========================================
 if __name__ == "__main__":
-    # 通常は src/flow/run_flow.py を使用してください。ここは最小限の動作確認用です。
-    json_file = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        _REPO_ROOT, "examples", "zif8", "zif8_two_solution_mixing_speed5.json")
-
-    robot_settings = {
-        "dobot_port": os.getenv("ROBOT1_DOBOT_PORT", "COM3"),
-    }
-    shared_settings = {
-        "scale_port": os.getenv("SCALE_PORT", "COM8"),
-        "camera_index": int(os.getenv("CAMERA_INDEX", "0")),
-    }
-
-    asyncio.run(execute_workflow(json_file, robot_settings, shared_settings))
+    # 以前はここで ZIF-8 の例を実機（COM3）で実行していた。誤起動で
+    # アームが動かないよう、案内だけ表示して終了する。
+    print(
+        "src/flow/executor.py は直接実行できません。フローは次のように実行します:\n"
+        "  python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --validate-only\n"
+        "  python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --mock",
+        file=sys.stderr,
+    )
+    sys.exit(2)

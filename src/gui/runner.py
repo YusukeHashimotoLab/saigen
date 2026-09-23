@@ -20,10 +20,21 @@ log finalisation) and cannot be sliced across script reruns.
 
 So the whole flow runs in **one background thread with one asyncio event loop**.
 Progress is published as :class:`ProgressEvent` objects on a thread-safe queue,
-which the Streamlit script drains on each rerun. Stopping cancels the asyncio
-task from the outside, which lands in ``ExperimentSession.run()``'s
-``except CancelledError`` branch - the same path Ctrl+C takes on the CLI - so the
-robots are emergency-stopped and everything is cleaned up and logged.
+which the Streamlit script drains on each rerun.
+
+Stop is an emergency stop
+-------------------------
+Cancelling the asyncio task alone is not enough: a cancellation only takes
+effect at the next ``await``, and the event loop can be blocked for a long time
+inside a synchronous Dobot move (pydobot polls with ``time.sleep``) or inside
+the ``pre_step`` safety-gate HTTP request. So :meth:`FlowRunner.request_stop`
+first calls ``ExperimentSession.emergency_stop_all()`` *directly from the UI
+thread* (it is synchronous and pydobot serialises serial access with its own
+lock), and only then cancels the task. The cancellation lands in
+``ExperimentSession.run()``'s ``except CancelledError`` branch - the same path
+Ctrl+C takes on the CLI - so everything is cleaned up and logged. The stop flag
+is also checked right before every step is dispatched, and a second Stop click
+is a no-op so it cannot inject a second CancelledError into the cleanup.
 """
 import asyncio
 import json
@@ -297,6 +308,10 @@ class FlowRunner:
         self._task: Optional[asyncio.Task] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # Set (on the loop thread) once the run itself has started unwinding
+        # because of Stop; a cancel scheduled by request_stop() is then dropped
+        # so it cannot land inside the session's cleanup.
+        self._unwinding = False
 
     # ------------------------------------------------------------------
     # Event plumbing
@@ -335,15 +350,41 @@ class FlowRunner:
         return self._thread is not None and self._thread.is_alive()
 
     def request_stop(self):
-        """Ask the run to stop; robots are emergency-stopped, then cleaned up."""
-        self._stop.set()
+        """Emergency-stop the robots now, then cancel the run.
+
+        Called from the UI thread. The robots are halted synchronously from
+        here, so the stop takes effect even while the run thread is blocked in
+        a device call; the asyncio task is cancelled afterwards so the run
+        unwinds through ``ExperimentSession.run()`` (cleanup, logging).
+
+        Idempotent: only the first call acts. A second click must not cancel
+        the task again, which would raise CancelledError inside the cleanup.
+        """
         with self._lock:
-            loop, task = self._loop, self._task
+            if self._stop.is_set():
+                return
+            self._stop.set()
+            loop, task, session = self._loop, self._task, self.session
+
+        # 1. Halt the hardware first, without waiting for the event loop.
+        if session is not None and self.status not in ("completed", "failed", "aborted"):
+            try:
+                session.emergency_stop_all()
+            except BaseException as e:  # noqa: BLE001 - still cancel the task below
+                logger.error("Emergency stop from the GUI failed: %r", e)
+
+        # 2. Then unwind the run (cleanup, run log) through the session.
         if loop is not None and task is not None and not loop.is_closed():
             try:
-                loop.call_soon_threadsafe(task.cancel)
+                loop.call_soon_threadsafe(self._cancel_task, task)
             except RuntimeError:
                 pass
+
+    def _cancel_task(self, task):
+        """Runs on the event-loop thread: cancel unless the run already unwinds."""
+        if not self._unwinding and not task.done():
+            self._unwinding = True
+            task.cancel()
 
     def stop_requested(self) -> bool:
         return self._stop.is_set()
@@ -431,11 +472,19 @@ class FlowRunner:
             shared_config=self.shared_config,
             workspace_validator=default_workspace_validator(),
         )
-        self.session = session
+        with self._lock:
+            self.session = session
+
+        def check_stop():
+            if self._stop.is_set():
+                self._unwinding = True
+                raise asyncio.CancelledError()
 
         async def body():
+            check_stop()
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
+                check_stop()
             if needs_scale or needs_camera or needs_microscope or needs_microscope_serial:
                 await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                          use_microscope=needs_microscope,
@@ -444,8 +493,7 @@ class FlowRunner:
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop
                 # pressed before the first await still aborts the run.
-                if self._stop.is_set():
-                    raise asyncio.CancelledError()
+                check_stop()
                 action = step.get("action")
                 rid = None if action in SHARED_DEVICE_ACTIONS else step.get("robot_id", 1)
                 if self.pre_step is not None:
@@ -462,6 +510,9 @@ class FlowRunner:
                     "shared" if rid is None else f"Robot {rid}", action, _fmt_params(step),
                 )
                 iteration = step.get("_iteration")
+                # Last check right before the step is dispatched: pre_step can
+                # block (HTTP safety gate) and Stop may have been pressed meanwhile.
+                check_stop()
                 t0 = time.monotonic()
                 try:
                     result = await execute_step(step, session.robots, session.shared, logger)

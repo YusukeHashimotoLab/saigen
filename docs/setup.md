@@ -113,10 +113,14 @@ validated, so keep the whole reach clear. Ctrl+C during the sweep is the same
 emergency stop as in a flow: the queue is force-stopped and the arm halts.
 
 For the arm, confirm the `workspace` section of `config.yaml` matches your fixtures
-before running any flow: every `move_xyz` / `move_z` / `rotate` target is checked
-against those limits **before** the robot is commanded, and a violation aborts the
-run. The check also runs in `--mock` mode, so you can screen a flow for
-out-of-range moves without hardware.
+before running any flow. Absolute targets (`move_xyz`, `rotate`) are checked
+against those limits by a preflight before any device is opened, both with
+`--validate-only` and at the start of every run. Relative moves (`move_z`,
+`rotate_relative`, `move_radial`) depend on where the arm starts, so they are
+checked move by move, **before** each command is sent, in `--mock` mode and in
+a real run; a violation aborts the run. If `config.yaml` exists but cannot be
+read (invalid YAML, PyYAML missing), every command refuses to start instead of
+falling back to the wider built-in defaults.
 
 ## 5. First run without hardware
 
@@ -125,9 +129,14 @@ python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json -
 python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --mock
 ```
 
-`--validate-only` checks the JSON against the schema and expands loops.
+`--validate-only` checks the JSON against the schema (unknown keys, NaN and
+out-of-range values are rejected), expands loops and checks every absolute target
+(`move_xyz`, `rotate`) against the workspace limits, without opening any device; a
+violation exits non-zero with the step number, coordinates and limits. Relative
+moves are reported as "unverified until run".
 `--mock` runs the whole flow against simulated robots and logs every action; the
-workspace limits are enforced, and recording is always off. A mock run produces the
+workspace limits are enforced move by move, including relative moves, and
+recording is always off. A mock run produces the
 same `logs/<date>/<flow name>_<timestamp>/` folder as a real one, so you can inspect
 `run.log`, `measurements.csv`, `summary.md` and `metadata.json` before touching
 hardware.

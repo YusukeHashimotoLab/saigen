@@ -147,6 +147,10 @@ picus.DEBUG = True  # デバッグ出力を有効化
 
 吸引・吐出などの操作は一定時間を要します。`calculate_operation_time()`メソッドは操作にかかる推定時間を計算し、その時間が経過するまで待機します。速度（1-9）と量（mL）に基づいて計算されます。
 
+### エラー処理
+
+コマンドやボタン/トリガーの送信に失敗した場合（`serial.SerialException`、Bleak の例外、ポートが閉じている場合など）は、`Picus2CommandError`（`ConnectionError` の派生）が送出されます。以前は `button()` がこれらの例外を握りつぶして正常終了していたため、吸引/吐出トリガーの失敗が「完了」と記録され、`LabRobot` の保持量が実際と食い違うことがありました。USB 接続でポート生成後の確認に失敗した場合は、ポートを閉じてから例外を伝播します。`Picus2CommandError` は `src.devices.picus2.picus2_controller` から import してください（`except ConnectionError` でも捕捉できます）。
+
 ## 依存関係
 
 - `asyncio` - 非同期処理

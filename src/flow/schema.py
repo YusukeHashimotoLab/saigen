@@ -1,14 +1,30 @@
 #jsonの型検証ファイル（validation有）
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Literal, Union, List, Optional
+
+# ==========================================
+# 0. 共通の基底モデル
+# ==========================================
+
+class _StrictModel(BaseModel):
+    """全アクションとワークフローの基底。
+
+    - ``allow_inf_nan=False``: JSON の NaN / Infinity を拒否する。NaN は大小比較が
+      常に False になり、可動域チェックをすり抜けるため。
+    - ``extra="forbid"``: 未知のキーを拒否する。``"robotid": 2`` のような綴り
+      間違いが黙って捨てられ、既定の robot_id=1 に送られるのを防ぐ。
+      ``_iteration`` は expand_loops() が検証後に付けるキーなので影響しない。
+    """
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+
 
 # ==========================================
 # 1. 個別のアクション定義 (Dobot用)
 # ==========================================
 
 #...は必須項目を示す
-class ActionMoveXYZ(BaseModel):
+class ActionMoveXYZ(_StrictModel):
     """
     XYZ絶対座標への移動
     LabRobot.move_xyz(x, y, z) に対応
@@ -27,7 +43,7 @@ class ActionMoveXYZ(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionMoveZ(BaseModel):
+class ActionMoveZ(_StrictModel):
     """
     Z軸方向への相対移動
     LabRobot.move_z(distance) に対応
@@ -47,7 +63,7 @@ class ActionMoveZ(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionRotate(BaseModel):
+class ActionRotate(_StrictModel):
     """
     ベース回転（Joint1）
     LabRobot.rotate(angle) に対応
@@ -67,7 +83,7 @@ class ActionRotate(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionRotateRelative(BaseModel):
+class ActionRotateRelative(_StrictModel):
     """
     ベース相対回転（Joint1）
     LabRobot.rotate_relative(delta_angle, speed) に対応
@@ -91,7 +107,7 @@ class ActionRotateRelative(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionMoveRadial(BaseModel):
+class ActionMoveRadial(_StrictModel):
     """
     半径方向への相対移動（円柱座標系）
     LabRobot.move_radial(distance) に対応
@@ -113,7 +129,7 @@ class ActionMoveRadial(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionGoHome(BaseModel):
+class ActionGoHome(_StrictModel):
     """
     ホームポジションへの復帰
     LabRobot.go_home() に対応
@@ -133,7 +149,7 @@ class ActionGoHome(BaseModel):
 # 1.1 個別のアクション定義 (Dobot周辺機器用)
 # ==========================================
 
-class ActionMoveSlider(BaseModel):
+class ActionMoveSlider(_StrictModel):
     """
     スライダー（リニアレール）を絶対位置に移動
     LabRobot.move_slider(position) に対応
@@ -155,7 +171,7 @@ class ActionMoveSlider(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionMoveConveyer(BaseModel):
+class ActionMoveConveyer(_StrictModel):
     """
     コンベアベルトを動作させる
     LabRobot.move_conveyer(index, speed, duration) に対応
@@ -189,7 +205,7 @@ class ActionMoveConveyer(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionWait(BaseModel):
+class ActionWait(_StrictModel):
     """
     待機（ユーティリティ）
     asyncio.sleep(seconds) に対応
@@ -214,7 +230,7 @@ class ActionWait(BaseModel):
 # 1.5 個別のアクション定義 (Picus2電動ピペット用)
 # ==========================================
 
-class ActionAspirate(BaseModel):
+class ActionAspirate(_StrictModel):
     """
     液体の吸引
     LabRobot.aspirate(volume, speed) に対応
@@ -246,7 +262,7 @@ class ActionAspirate(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionDispense(BaseModel):
+class ActionDispense(_StrictModel):
     """
     液体の分注
     LabRobot.dispense(volume, speed) に対応
@@ -278,7 +294,7 @@ class ActionDispense(BaseModel):
         description="操作対象のロボットID (1, 2, or 3)"
     )
 
-class ActionBlowOut(BaseModel):
+class ActionBlowOut(_StrictModel):
     """
     液体の完全排出（ブローアウト）
     LabRobot.blow_out(go_home, speed, delay_ms) に対応
@@ -316,7 +332,7 @@ class ActionBlowOut(BaseModel):
 # 1.6 個別のアクション定義 (共有デバイス: Webcam用)
 # ==========================================
 
-class ActionCaptureAndSave(BaseModel):
+class ActionCaptureAndSave(_StrictModel):
     """
     Webcamで画像をキャプチャしてファイルに保存
     SharedDevices.capture_and_save(file_path) に対応
@@ -334,7 +350,7 @@ class ActionCaptureAndSave(BaseModel):
     )
 
 
-class ActionCaptureMicroscope(BaseModel):
+class ActionCaptureMicroscope(_StrictModel):
     """
     USB デジタル顕微鏡（UVC、例: サンワサプライ 400-CAM106）で画像をキャプチャして保存
     SharedDevices.capture_microscope(file_path) に対応
@@ -352,7 +368,7 @@ class ActionCaptureMicroscope(BaseModel):
     )
 
 
-class ActionMicroscopeLed(BaseModel):
+class ActionMicroscopeLed(_StrictModel):
     """
     USB デジタル顕微鏡（UM22 系）の LED 照明の点灯/消灯と明るさ
     SharedDevices.set_microscope_led(on, level) に対応
@@ -378,7 +394,7 @@ class ActionMicroscopeLed(BaseModel):
     )
 
 
-class ActionMicroscopeFocus(BaseModel):
+class ActionMicroscopeFocus(_StrictModel):
     """
     USB デジタル顕微鏡（UM22 系）の焦点合わせ
     SharedDevices.focus_microscope(mode, position, direction, steps, timeout) に対応
@@ -430,7 +446,7 @@ class ActionMicroscopeFocus(BaseModel):
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)
 # ==========================================
 
-class ActionMeasureWeight(BaseModel):
+class ActionMeasureWeight(_StrictModel):
     """
     BCE8221電子天秤で重量測定
     SharedDevices.measure_weight(stabilization_count) に対応
@@ -449,7 +465,7 @@ class ActionMeasureWeight(BaseModel):
         description="測定回数（中央値を返す）"
     )
 
-class ActionTareScale(BaseModel):
+class ActionTareScale(_StrictModel):
     """
     BCE8221電子天秤の風袋引き（ゼロ点リセット）
     SharedDevices.tare_scale(delay) に対応
@@ -472,7 +488,7 @@ class ActionTareScale(BaseModel):
 # 1.8 個別のアクション定義 (ループ制御)
 # ==========================================
 
-class ActionLoopStart(BaseModel):
+class ActionLoopStart(_StrictModel):
     """
     ループ開始マーカー
     loop_idで対応するloop_endと紐づける
@@ -496,7 +512,7 @@ class ActionLoopStart(BaseModel):
         description="繰り返し回数（1-1000）"
     )
 
-class ActionLoopEnd(BaseModel):
+class ActionLoopEnd(_StrictModel):
     """
     ループ終了マーカー
     loop_idで対応するloop_startと紐づける
@@ -557,7 +573,7 @@ DobotAction = LabRobotAction
 # 3. ワークフロー全体の定義
 # ==========================================
 
-class ExperimentWorkflow(BaseModel):
+class ExperimentWorkflow(_StrictModel):
     """
     実験ワークフロー全体の定義
     """

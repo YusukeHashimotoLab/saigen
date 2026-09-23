@@ -50,10 +50,15 @@ python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json -
 python -m src.flow.csv_runner.run_csv --mock
 ```
 
-`--validate-only` checks a flow against the schema and the workspace limits
-without opening any device. `--mock` executes it end to end against simulated
-devices, with the same validation. Run both after any change to a flow, the
-schema, the executor or `config.yaml`. The CI workflow in
+`--validate-only` checks a flow against the schema and the loop structure, and
+checks every absolute target (`move_xyz`, `rotate`) against the workspace limits,
+without opening any device. Relative moves (`move_z`, `rotate_relative`,
+`move_radial`) depend on the start pose, so `--validate-only` lists them as
+"unverified until run"; they are checked move by move at `--mock` and at run
+time. `--mock` executes the flow end to end against simulated devices, with the
+same validation. Run both after any change to a flow, the schema, the executor
+or `config.yaml`. A `config.yaml` that exists but cannot be parsed is an error,
+never a silent fallback to the built-in defaults. The CI workflow in
 `.github/workflows/ci.yml` runs the same steps and must stay green.
 
 ## Rules

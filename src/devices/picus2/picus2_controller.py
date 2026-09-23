@@ -83,6 +83,15 @@ def nominal_operation_time(amount: float, speed: int) -> float:
     return amount * SECONDS_PER_10000UL[speed] / 10
 
 
+class Picus2CommandError(ConnectionError):
+    """Picus2 へのコマンド送信（ボタン/トリガー含む）に失敗したことを表す例外。
+
+    ``ConnectionError`` の派生なので、既存の ``except ConnectionError`` でも捕捉できる。
+    送信失敗を握りつぶして正常終了すると、呼び出し側（LabRobot）が液体が動いた
+    ものとして保持量を更新してしまうため、失敗は必ずこの例外で伝播させる。
+    """
+
+
 class ConnectionType(Enum):
     """接続タイプを表す列挙型"""
     USB = "usb"
@@ -195,14 +204,30 @@ class Picus2Controller:
                 f"Picus2 のUSB接続に失敗しました (port={self.address}): {e}"
             ) from e
 
-        if not getattr(self.serial, "is_open", False):
-            self.serial = None
-            raise ConnectionError(
-                f"Picus2 のUSBポートを開けませんでした (port={self.address})"
-            )
+        try:
+            if not getattr(self.serial, "is_open", False):
+                raise ConnectionError(
+                    f"Picus2 のUSBポートを開けませんでした (port={self.address})"
+                )
+        except BaseException:
+            # ポートオブジェクト生成後の失敗ではハンドルを閉じてから伝播する（リーク防止）
+            self._close_serial_quietly()
+            raise
 
         self.debug_print(f"USB接続状態: True")
         return True
+
+    def _close_serial_quietly(self):
+        """接続処理の途中失敗時にシリアルポートを閉じて破棄する（元の例外を優先）。"""
+        port, self.serial = self.serial, None
+        if port is None:
+            return
+        try:
+            port.close()
+        except Exception as close_error:  # 元の例外を隠さないためここでは記録のみ
+            logger.warning(
+                f"Picus2 のUSBポートを閉じられませんでした (port={self.address}): {close_error}"
+            )
 
     async def _connect_bluetooth(self) -> bool:
         """Bluetooth経由でPicus2に接続する（失敗時は ConnectionError）"""
@@ -272,24 +297,45 @@ class Picus2Controller:
 
         Args:
             command (str): 送信するコマンド
+
+        Raises:
+            Picus2CommandError: 未接続、またはシリアル/Bluetooth の書き込みに
+                失敗した場合。``serial.SerialException`` や Bleak の例外も
+                すべてこの例外（ConnectionError 派生）に包んで伝播する。
         """
         self.debug_print(f"送信: {command}")
-        if self.connection_type == ConnectionType.USB:
-            await self._send_command_usb(command)
-        else:
-            await self._send_command_bluetooth(command)
+        try:
+            if self.connection_type == ConnectionType.USB:
+                await self._send_command_usb(command)
+            else:
+                await self._send_command_bluetooth(command)
+        except Picus2CommandError:
+            raise
+        except Exception as e:
+            raise Picus2CommandError(
+                f"Picus2 へのコマンド送信に失敗しました (address={self.address}, "
+                f"type={self.connection_type.value}, command={command}): {e}"
+            ) from e
 
     async def _send_command_usb(self, command: str):
-        """USB経由でコマンドを送信する"""
-        if self.serial and self.serial.is_open:
-            self.serial.flush()
-            self.serial.write(f"{command}\r\n".encode("utf-8"))
+        """USB経由でコマンドを送信する（ポートが閉じていれば例外。以前は黙って無視）"""
+        if not (self.serial and self.serial.is_open):
+            raise Picus2CommandError(
+                f"Picus2 のUSBポートが開いていないためコマンドを送信できません "
+                f"(port={self.address})"
+            )
+        self.serial.flush()
+        self.serial.write(f"{command}\r\n".encode("utf-8"))
 
     async def _send_command_bluetooth(self, command: str):
-        """Bluetooth経由でコマンドを送信する"""
-        if self.client:
-            write_value = bytearray(f"{command}\r\n", "utf-8")
-            await self.client.write_gatt_char(self.COMMAND_CHARACTERISTIC_UUID, write_value)
+        """Bluetooth経由でコマンドを送信する（クライアントが無ければ例外。以前は黙って無視）"""
+        if not self.client:
+            raise Picus2CommandError(
+                f"Picus2 の Bluetooth クライアントが無いためコマンドを送信できません "
+                f"(address={self.address})"
+            )
+        write_value = bytearray(f"{command}\r\n", "utf-8")
+        await self.client.write_gatt_char(self.COMMAND_CHARACTERISTIC_UUID, write_value)
 
     async def __notification_handler(self, sender, data: bytearray):
         """
@@ -319,7 +365,14 @@ class Picus2Controller:
         start_time = time.time()
         while True:
             if self.serial and self.serial.is_open:
-                line = self.serial.readline().decode("utf-8").strip()
+                try:
+                    raw = self.serial.readline()
+                except Exception as e:
+                    raise Picus2CommandError(
+                        f"Picus2 からの応答待ち中に読み取りに失敗しました "
+                        f"(port={self.address}, waiting for {target_prefix}): {e}"
+                    ) from e
+                line = raw.decode("utf-8", errors="replace").strip()
                 if line:
                     self.debug_print(f"USB受信: {line}")
                 if line.startswith(target_prefix):
@@ -359,17 +412,20 @@ class Picus2Controller:
         Args:
             button (str): 押すボタンの種類（Buttonsクラス定数を使用）
             interval (float, optional): ボタンを押したあとの待機時間(秒). デフォルト: 1
+
+        Raises:
+            ConnectionError: 未接続の場合
+            Picus2CommandError: ボタン/トリガーコマンドの送信に失敗した場合。
+                以前はここで ``serial.SerialException`` や Bleak の例外を握りつぶして
+                正常終了していたため、吸引/吐出トリガーの失敗が「完了」と記録され、
+                LabRobot の保持量が実際と食い違う原因になっていた。
         """
         self._require_connection()
-        try:
-            self.end_flag = False  # END待ちのフラグをリセット
-            await self.send_command(f'{{"button": "{button}"}}')
-            # await self.wait_until_END_received() # ENDが受信されるまで待機
-            await asyncio.sleep(interval)  # 操作が終わる前にENDが帰ってくる場合があるため一定時間待機
-        except ConnectionError:
-            raise
-        except Exception as e:
-            self.debug_print(f"エラー: {e}")
+        self.end_flag = False  # END待ちのフラグをリセット
+        # send_command は失敗をすべて Picus2CommandError として送出する
+        await self.send_command(f'{{"button": "{button}"}}')
+        # await self.wait_until_END_received() # ENDが受信されるまで待機
+        await asyncio.sleep(interval)  # 操作が終わる前にENDが帰ってくる場合があるため一定時間待機
 
     async def set_motor_mode(self, mode: bool):
         """

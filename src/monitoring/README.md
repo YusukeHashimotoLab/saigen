@@ -69,6 +69,15 @@ holds a UV index as a float. The column name is unchanged so older CSV files
 remain parseable. Because a 20-bit conversion takes 400 ms, the value updates
 about once a second even though the agent samples every 100 ms.
 
+**Humidity recorded before 2026-09-23 is wrong by a factor of 1024.** The Pi
+agent's BME280 compensation shifted the Q22.10 result right by 22 bits (which
+already gives whole %RH) and then divided by 1024 again, so the `humidity`
+column of older recordings holds values between 0 and about 0.098 instead of
+0-100 %RH. Multiplying an old value by 1024 recovers the humidity, but only to
+1 %RH: the 22-bit shift had already dropped the fractional part, so every
+recovered value is a whole number (rounded down). Recordings made with the
+fixed agent carry the full resolution of 1/1024 %RH.
+
 ## Raspberry Pi setup
 
 1. Flash **Raspberry Pi OS Lite (Bookworm, 32-bit)** to the SD card with
@@ -254,7 +263,7 @@ this layout; they are placeholders, not measurements from an actual run.
 | `timestamp` | ISO 8601, UTC, with offset (e.g. `2026-01-01T03:00:00.000000+00:00`) |
 | `hostname` | Reporting Pi's hostname |
 | `temperature` | °C |
-| `humidity` | %RH |
+| `humidity` | %RH; divided by 1024 (0-0.098) in every recording made before 2026-09-23, see [Measured quantities](#measured-quantities) |
 | `lux` | Illuminance |
 | `uvi` | UV index (float); `0` in every recording made before 2026-09-08, see [Measured quantities](#measured-quantities) |
 | `voc_raw` | VOC, raw sensor signal |

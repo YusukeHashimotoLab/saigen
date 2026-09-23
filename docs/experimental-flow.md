@@ -27,8 +27,9 @@ and executed by [`src/flow/executor.py`](../src/flow/executor.py). Run
 | `steps` | array | yes | executed in order; each element is one of the actions below |
 
 Every step has an `action` field. Robot actions take `robot_id` (1–3, default 1);
-shared-device actions (balance, camera) do not. Unknown fields or out-of-range values
-are rejected at validation time.
+shared-device actions (balance, camera) do not. Unknown fields (e.g. a misspelled
+`robotid`), out-of-range values and non-finite numbers (`NaN`, `Infinity`) are
+rejected at validation time.
 
 ## Actions
 
@@ -75,7 +76,8 @@ Speed 1 is slowest, 9 fastest (about 1–11 mL/s for a 10 mL tip, from the manuf
 | `loop_end` | `loop_id` | End the loop with the same `loop_id` |
 
 Loops are expanded into a flat list before execution (`expand_loops`). Nesting is not
-supported; a `loop_start` without a matching `loop_end` (or vice versa) is an error.
+supported; a `loop_start` without a matching `loop_end` (or vice versa), or a
+`loop_end` with a different `loop_id` inside a loop body, is an error.
 
 ## Validation rules
 
@@ -84,9 +86,14 @@ Applied before any device moves:
 1. **Schema** — every step must match exactly one action model; types and ranges
    above are enforced by Pydantic.
 2. **Loop structure** — `loop_id`s must pair up and must not nest.
-3. **Pipette volume tracking** (run time, in the safety wrapper) — cumulative
+3. **Workspace preflight** (`--validate-only` and before every run, no device
+   opened) — every absolute target (`move_xyz`, `rotate`) is checked against the
+   `workspace` section of `config.yaml`. Relative moves (`move_z`,
+   `rotate_relative`, `move_radial`) depend on the start pose and are listed as
+   "unverified until run"; rule 5 checks them.
+4. **Pipette volume tracking** (run time, in the safety wrapper) — cumulative
    `aspirate` may not exceed 10 mL; `dispense` may not exceed the volume held.
-4. **Workspace limits** (run time) — `move_xyz` / `move_z` / `rotate*` targets are
+5. **Workspace limits** (run time, move by move) — `move_xyz` / `move_z` / `rotate*` targets are
    checked against the XYZ box and joint-1 range in the `workspace` section of
    `config.yaml`; a violation raises before the command is sent, aborting the run.
    The same check runs in `--mock` mode, so a flow can be screened for out-of-range

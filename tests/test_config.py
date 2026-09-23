@@ -86,12 +86,14 @@ def test_missing_files_fall_back_to_defaults(restore_config_path):
     assert lab_config.load_config(force_reload=True) == lab_config.DEFAULTS
 
 
-def test_broken_yaml_falls_back_without_raising(tmp_path, restore_config_path):
+def test_broken_yaml_raises_instead_of_falling_back(tmp_path, restore_config_path):
+    """壊れた config.yaml は DEFAULTS（±300 mm の可動域）に黙って戻さず例外にする"""
     broken = tmp_path / "config.yaml"
     broken.write_text("- broken\n- list\n", encoding="utf-8")
     lab_config.CONFIG_PATH = str(broken)
     lab_config.EXAMPLE_CONFIG_PATH = "/nonexistent/config.example.yaml"
-    assert lab_config.load_config(force_reload=True) == lab_config.DEFAULTS
+    with pytest.raises(lab_config.ConfigError, match="mapping"):
+        lab_config.load_config(force_reload=True)
 
 
 def test_dashboard_ports_come_from_monitoring_config():

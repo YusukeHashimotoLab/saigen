@@ -23,13 +23,14 @@
 """
 import asyncio
 import logging
+import threading
 from typing import Awaitable, Callable, Dict, Optional
 
 from src import config as lab_config
 from src.devices.safety.lab_robot import LabRobot
 from src.devices.safety.mock_robot import MockLabRobot, MockSharedDevices
 from src.devices.safety.shared_devices import SharedDevices
-from src.devices.safety.validators import default_workspace_validator
+from src.devices.safety.validators import ValidationError, default_workspace_validator
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,11 @@ class ExperimentSession:
         self.status: str = "failed"
         self.error: Optional[str] = "実行が中断されました"
 
+        # 緊急停止済みのロボット（id）。GUI の Stop は UI スレッドから
+        # emergency_stop_all() を直接呼ぶため、ロックで保護する。
+        self._estop_lock = threading.Lock()
+        self._estopped_ids = set()
+
     # ------------------------------------------------------------------
     # 設定
     # ------------------------------------------------------------------
@@ -165,7 +171,15 @@ class ExperimentSession:
             workspace_validator=self.workspace_validator,
         )
         # initialize() は失敗時に例外を送出する（戻り値の握りつぶし防止）
-        if not await robot.initialize():
+        try:
+            ok = await robot.initialize()
+        except BaseException as e:
+            # 初期化中の中断（Stop / Ctrl+C）: 未登録なので session.cleanup() では
+            # 切断されない。ここで切断してから再送出する。
+            if not isinstance(e, Exception):
+                await self._cleanup_one(f"Robot {robot_id}", robot)
+            raise
+        if not ok:
             raise RuntimeError(f"Robot {robot_id} の初期化に失敗しました")
         robot.set_current_position_as_home()
         self.robots[robot_id] = robot
@@ -193,32 +207,70 @@ class ExperimentSession:
     # ------------------------------------------------------------------
     # 安全枠
     # ------------------------------------------------------------------
-    def emergency_stop_all(self):
-        """登録済み全ロボットを緊急停止する（例外を送出しない）"""
-        for robot in self.robots.values():
-            robot.emergency_stop()
+    def emergency_stop_all(self, *, skip_already_stopped: bool = False):
+        """登録済み全ロボットを緊急停止する（例外を送出しない）
+
+        同期関数で await を含まないため、イベントループがデバイス呼び出しで
+        ブロックされていても別スレッド（GUI の Stop）から直接呼び出せる。
+
+        Args:
+            skip_already_stopped: True なら、すでに緊急停止済みのロボットは
+                再送しない（GUI の Stop で停止済みのロボットに、キャンセル処理で
+                二重に停止コマンドを送らないため）。
+        """
+        # 実行スレッドが add_robot で辞書を更新中でも安全にスナップショットを取る
+        for rid, robot in list(self.robots.items()):
+            with self._estop_lock:
+                if skip_already_stopped and rid in self._estopped_ids:
+                    continue
+            try:
+                robot.emergency_stop()
+            except Exception as e:  # noqa: BLE001 - 1台の失敗で他を止め損ねない
+                logger.error(f"Robot {rid} の緊急停止に失敗しました: {e}")
+                continue  # 停止済みとして記録しない（次の呼び出しで再送する）
+            with self._estop_lock:
+                self._estopped_ids.add(rid)
 
     async def go_home_all(self):
-        """登録済み全ロボットをベストエフォートでホームに戻す"""
-        for rid, robot in self.robots.items():
+        """登録済み全ロボットをベストエフォートでホームに戻す
+
+        中断（CancelledError / KeyboardInterrupt）は捕捉せずに伝播させる。
+        呼び出し側（run）が緊急停止してから後始末する。
+        """
+        for rid, robot in list(self.robots.items()):
             try:
                 logger.info(f"Robot {rid} をホームに戻しています...")
                 await robot.go_home()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Robot {rid} のホーム復帰に失敗しました: {e}")
+
+    @staticmethod
+    async def _cleanup_one(name, device):
+        """1台を切断する。中断を含むすべての例外を捕捉して返す（送出しない）"""
+        try:
+            await device.cleanup()
+        except BaseException as e:  # noqa: BLE001 - 後始末は最後まで続ける
+            logger.error(f"{name} の切断中にエラー／中断: {e!r}")
+            return e
+        return None
 
     async def cleanup(self):
-        """全ロボット・共有デバイスをベストエフォートで切断する"""
-        for robot in self.robots.values():
-            try:
-                await robot.cleanup()
-            except Exception:
-                pass
+        """全ロボット・共有デバイスをベストエフォートで切断する
+
+        1台の失敗や切断中の中断（2回目のキャンセル、Ctrl+C）で残りの
+        デバイスの切断が飛ばされないよう、デバイスごとに BaseException を
+        捕捉して続行する。中断はすべての切断を試みた後に再送出する。
+        """
+        interrupted = None
+        devices = [(f"Robot {rid}", r) for rid, r in list(self.robots.items())]
         if self.shared is not None:
-            try:
-                await self.shared.cleanup()
-            except Exception:
-                pass
+            devices.append(("共有デバイス", self.shared))
+        for name, device in devices:
+            err = await self._cleanup_one(name, device)
+            if err is not None and not isinstance(err, Exception) and interrupted is None:
+                interrupted = err
+        if interrupted is not None:
+            raise interrupted
 
     async def run(self, body: Callable[[], Awaitable]):
         """実験本体を安全枠の中で実行する
@@ -226,7 +278,10 @@ class ExperimentSession:
         - 正常終了: status="completed" とし body の戻り値を返す
         - Ctrl+C / キャンセル: 全ロボットを緊急停止して再送出
           （ホーム復帰の追加動作はさせず、その場で止める）
-        - その他の例外: 全ロボットをホームに戻して再送出
+        - 可動域違反（ValidationError）: アームは動いていないので
+          ホーム復帰はせず、そのまま再送出
+        - その他の例外: 全ロボットをホームに戻して再送出。ホーム復帰中に
+          中断（Ctrl+C / キャンセル）された場合は緊急停止してから再送出
         - いずれの場合もクリーンアップ（切断）は必ず実行する
 
         exp_logger の確定は行わない。呼び出し側が finally で
@@ -239,12 +294,26 @@ class ExperimentSession:
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.warning("中断要求を受信しました。緊急停止します...")
             self.status, self.error = "aborted", "ユーザーによる中断（Ctrl+C）"
-            self.emergency_stop_all()
+            # GUI の Stop で UI スレッドから停止済みのロボットには再送しない
+            self.emergency_stop_all(skip_already_stopped=True)
             raise
         except Exception as e:
             logger.error(f"実行エラー: {e}")
             self.status, self.error = "failed", str(e)
-            await self.go_home_all()
+            if isinstance(e, ValidationError):
+                # 移動は検証で拒否され、コマンドは送信されていない。
+                # 未検証の復帰動作をさせる理由がないのでホーム復帰しない
+                logger.error("可動域違反のため移動は実行されていません。ホーム復帰は行いません")
+                raise
+            try:
+                await self.go_home_all()
+            except BaseException as recovery_interrupt:
+                # ホーム復帰中の Ctrl+C / キャンセル: 復帰動作をその場で止める
+                logger.warning("ホーム復帰中に中断されました。緊急停止します...")
+                self.status = "aborted"
+                self.error = f"{e}（ホーム復帰中に中断: 緊急停止済み）"
+                self.emergency_stop_all()
+                raise recovery_interrupt from e
             raise
         finally:
             await self.cleanup()

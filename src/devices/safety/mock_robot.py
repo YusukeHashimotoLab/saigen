@@ -3,7 +3,7 @@ import logging
 import math
 from typing import Optional
 
-from src.devices.safety.validators import WorkspaceValidator
+from src.devices.safety.validators import ValidationError, WorkspaceValidator
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,14 @@ class MockLabRobot:
         logger.info(f"✓ [MOCK Dobot] コンベアベルト動作完了")
 
     async def go_home(self):
+        """LabRobot.go_home と同じく、全区間を事前検証してから復帰する"""
+        home = self.home_position
+        if self.workspace_validator:
+            if self._pos[2] < home[2] - 0.1:
+                self.workspace_validator.validate_z_relative(self._pos[2], home[2] - self._pos[2])
+            if len(home) >= 4:
+                self.workspace_validator.validate_joint1(home[3])
+            self.workspace_validator.validate_xyz(home[0], home[1], home[2])
         logger.info("[MOCK Dobot] ホームポジションへ復帰中...")
         await asyncio.sleep(1.0)
         self._pos[:] = list(self.home_position)
@@ -131,7 +139,25 @@ class MockLabRobot:
     def set_current_position_as_home(self):
         self.home_position = list(self._pos)
         logger.info(f"✓ [MOCK Dobot] 現在位置をホームに設定: {self.home_position}")
+        self.home_is_within_limits()
         return self.home_position
+
+    def home_is_within_limits(self) -> bool:
+        """LabRobot.home_is_within_limits と同じ検証（可動域外なら警告）"""
+        if self.workspace_validator is None or self.home_position is None:
+            return True
+        home = self.home_position
+        try:
+            self.workspace_validator.validate_xyz(home[0], home[1], home[2])
+            if len(home) >= 4:
+                self.workspace_validator.validate_joint1(home[3])
+        except ValidationError as e:
+            logger.warning(
+                "警告: [MOCK] ホームとして取得した現在位置が workspace 可動域外です。"
+                f"go_home() はこのホームへの移動を拒否します。\n{e}"
+            )
+            return False
+        return True
 
     # ===== 電動ピペット操作 =====
 

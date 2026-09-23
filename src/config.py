@@ -8,7 +8,12 @@ Resolution order (first file that exists wins, merged over ``DEFAULTS``):
 
     1. ``<repo>/config.yaml``          - your own copy, gitignored
     2. ``<repo>/config.example.yaml``  - tracked template, same values as DEFAULTS
-    3. ``DEFAULTS`` below              - used when PyYAML is missing or both files are
+    3. ``DEFAULTS`` below              - used only when neither file exists
+
+A file that exists but cannot be used (PyYAML missing, unreadable, invalid YAML,
+top level not a mapping) raises :class:`ConfigError`. It never falls back to
+``DEFAULTS``: those carry the spec-envelope workspace (+-300 mm) and default COM
+ports, so a silent fallback would widen the workspace limits the lab measured.
 
 Missing keys are filled in from ``DEFAULTS``, so a partial config.yaml that only
 overrides a couple of ports keeps working after an upgrade.
@@ -74,25 +79,37 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return merged
 
 
-def _load_yaml_file(path: str):
-    """Read one YAML mapping, or return None if unusable (never raises)."""
+class ConfigError(RuntimeError):
+    """An existing config file cannot be used.
+
+    Deliberately not an ImportError/OSError subclass, so callers that catch
+    those (e.g. ``default_workspace_validator``) cannot mistake it for
+    "config module unavailable" and fall back to wider built-in limits.
+    """
+
+
+def _load_yaml_file(path: str) -> dict:
+    """Read one YAML mapping; raise ConfigError if the file is unusable."""
     try:
         import yaml
-    except ImportError:
-        logger.warning(
-            "PyYAML is not installed, so %s cannot be read; using built-in "
-            "defaults (run: pip install -r requirements.txt)", path
-        )
-        return None
+    except ImportError as e:
+        raise ConfigError(
+            f"PyYAML is not installed, so {path} cannot be read "
+            f"(run: pip install -r requirements.txt). Refusing to fall back to "
+            f"built-in defaults."
+        ) from e
     try:
         with open(path, encoding="utf-8") as f:
-            loaded = yaml.safe_load(f) or {}
-        if not isinstance(loaded, dict):
-            raise ValueError("the top level must be a mapping")
-        return loaded
-    except Exception as e:  # noqa: BLE001 - config must never break a run
-        logger.error("Could not read %s; using built-in defaults: %s", path, e)
-        return None
+            loaded = yaml.safe_load(f)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise ConfigError(f"Could not read {path}: {e}") from e
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ConfigError(
+            f"{path}: the top level must be a mapping, got {type(loaded).__name__}"
+        )
+    return loaded
 
 
 def load_config(force_reload: bool = False) -> dict:
@@ -105,9 +122,7 @@ def load_config(force_reload: bool = False) -> dict:
     for path in (CONFIG_PATH, EXAMPLE_CONFIG_PATH):
         if not os.path.exists(path):
             continue
-        loaded = _load_yaml_file(path)
-        if loaded is not None:
-            config = _deep_merge(config, loaded)
+        config = _deep_merge(config, _load_yaml_file(path))
         break
     else:
         logger.warning(
@@ -130,9 +145,7 @@ def load_monitoring_config(force_reload: bool = False) -> dict:
         path = os.path.join(MONITORING_DIR, name)
         if not os.path.exists(path):
             continue
-        loaded = _load_yaml_file(path)
-        if loaded is not None:
-            config = _deep_merge(config, loaded)
+        config = _deep_merge(config, _load_yaml_file(path))
         break
 
     _monitoring_cache = config
