@@ -1,7 +1,7 @@
 #jsonの型検証ファイル（validation有）
 
 from pydantic import BaseModel, Field
-from typing import Literal, Union, List
+from typing import Literal, Union, List, Optional
 
 # ==========================================
 # 1. 個別のアクション定義 (Dobot用)
@@ -333,6 +333,93 @@ class ActionCaptureAndSave(BaseModel):
         description="保存先のファイル名（空欄で自動生成）"
     )
 
+
+class ActionCaptureMicroscope(BaseModel):
+    """
+    USB デジタル顕微鏡（UVC、例: サンワサプライ 400-CAM106）で画像をキャプチャして保存
+    SharedDevices.capture_microscope(file_path) に対応
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["capture_microscope"] = Field(
+        ...,
+        description="アクション識別子: 顕微鏡画像キャプチャ・保存"
+    )
+    file_path: str = Field(
+        default="",
+        description="保存先のファイル名（空欄で自動生成）"
+    )
+
+
+class ActionMicroscopeLed(BaseModel):
+    """
+    USB デジタル顕微鏡（UM22 系）の LED 照明の点灯/消灯と明るさ
+    SharedDevices.set_microscope_led(on, level) に対応
+
+    制御用シリアルポート (config.yaml の shared_devices.microscope_port) が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["microscope_led"] = Field(
+        ...,
+        description="アクション識別子: 顕微鏡 LED 制御"
+    )
+    on: bool = Field(
+        default=True,
+        description="True で点灯、False で消灯"
+    )
+    level: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=255,
+        description="明るさ (0-255、出荷時 12)。省略時は変更しない"
+    )
+
+
+class ActionMicroscopeFocus(BaseModel):
+    """
+    USB デジタル顕微鏡（UM22 系）の焦点合わせ
+    SharedDevices.focus_microscope(mode, position, direction, steps, timeout) に対応
+
+    実行後のレンズ位置は measurements.csv の focus_position 列に記録される。
+    再現性の点では、一度合焦した位置を読み取って mode="position" で指定するのが確実。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["microscope_focus"] = Field(
+        ...,
+        description="アクション識別子: 顕微鏡フォーカス"
+    )
+    mode: Literal["auto", "position", "step"] = Field(
+        default="auto",
+        description="auto = ワンショット AF / position = レンズ位置指定 / step = ステップ移動"
+    )
+    position: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=65535,
+        description="mode=position の目標レンズ位置（実機で 346-1766 を観測、出荷時 1568）"
+    )
+    direction: Literal["in", "out"] = Field(
+        default="in",
+        description="mode=step の方向"
+    )
+    steps: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        description="mode=step の回数"
+    )
+    timeout: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=300.0,
+        description="モーター停止を待つ上限秒。AF が収束しない場合はこの時間で手動モードに戻す"
+    )
+
 # ==========================================
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)
 # ==========================================
@@ -443,6 +530,10 @@ LabRobotAction = Union[
     ActionBlowOut,
     # カメラ操作
     ActionCaptureAndSave,
+    # デジタル顕微鏡操作
+    ActionCaptureMicroscope,
+    ActionMicroscopeLed,
+    ActionMicroscopeFocus,
     # 電子天秤操作（BCE8221）
     ActionMeasureWeight,
     ActionTareScale,

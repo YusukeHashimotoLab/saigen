@@ -42,6 +42,7 @@ https://youtu.be/5X2-4LuQfns
 | `cad/` | CAD design bank of 3D-printable experimental components (STL + editable Fusion 360 sources) |
 | `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument |
 | `examples/zif8/` | Sample experimental flows of the ZIF-8 demonstration (JSON equivalents of the spreadsheet sequence) and monitoring CSV templates |
+| `examples/microscope/` | Example flow that photographs the product with the USB digital microscope (`capture_microscope`) |
 | `examples/dispensing_stability/` | Measured data of the 100-shot dispensing-repeatability test and the script that recorded it |
 
 ## Getting started

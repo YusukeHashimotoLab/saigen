@@ -61,19 +61,24 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     )
 
 
-def default_shared_factory(*, use_scale, use_camera, config):
+def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
         use_camera=use_camera,
+        use_microscope=use_microscope,
         scale_port=config["scale_port"],
         camera_index=config["camera_index"],
+        microscope_index=config.get("microscope_index", 2),
+        microscope_port=config.get("microscope_port", ""),
+        microscope_resolution=config.get("microscope_resolution", ""),
     )
 
 
-def mock_shared_factory(*, use_scale, use_camera, config):
+def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False):
     """MockSharedDevices を生成するファクトリ"""
-    return MockSharedDevices(use_scale=use_scale, use_camera=use_camera)
+    return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
+                             use_microscope=use_microscope)
 
 
 class ExperimentSession:
@@ -167,10 +172,12 @@ class ExperimentSession:
         )
         return robot
 
-    async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False):
+    async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
+                         use_microscope: bool = False):
         """設定の値で共有デバイスを生成・初期化して登録する"""
         shared = self.shared_factory(
-            use_scale=use_scale, use_camera=use_camera, config=self.shared_config()
+            use_scale=use_scale, use_camera=use_camera, use_microscope=use_microscope,
+            config=self.shared_config(),
         )
         if not await shared.initialize():
             raise RuntimeError("共有デバイスの初期化に失敗しました")

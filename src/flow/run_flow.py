@@ -49,7 +49,7 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS
+from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession
 from src.flow.schema import ExperimentWorkflow
@@ -199,6 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="電子天秤のポート（既定: SCALE_PORT / config.yaml）")
     p.add_argument("--camera-index", type=int, default=None,
                    help="capture_and_save 用カメラ index（既定: CAMERA_INDEX / config.yaml）")
+    p.add_argument("--microscope-index", type=int, default=None,
+                   help="capture_microscope 用の顕微鏡カメラ index（既定: MICROSCOPE_INDEX / config.yaml）")
+    p.add_argument("--microscope-port", default=None,
+                   help="顕微鏡 LED 制御用シリアルポート（既定: MICROSCOPE_PORT / config.yaml。空なら LED 制御なし）")
     record = p.add_mutually_exclusive_group()
     record.add_argument("--record", dest="record", action="store_true", default=None,
                         help="センサーCSV・動画の録画を行う（実機実行時の既定）")
@@ -235,6 +239,14 @@ def resolve_ports(args) -> Tuple[dict, dict]:
     camera = args.camera_index if args.camera_index is not None else os.getenv("CAMERA_INDEX")
     if camera not in (None, ""):
         shared_config["camera_index"] = int(camera)
+    microscope = (getattr(args, "microscope_index", None)
+                  if getattr(args, "microscope_index", None) is not None
+                  else os.getenv("MICROSCOPE_INDEX"))
+    if microscope not in (None, ""):
+        shared_config["microscope_index"] = int(microscope)
+    microscope_port = getattr(args, "microscope_port", None) or os.getenv("MICROSCOPE_PORT")
+    if microscope_port:
+        shared_config["microscope_port"] = microscope_port
 
     return robot_ports, shared_config
 
@@ -270,7 +282,8 @@ def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
             picus2_robots.add(rid)
     needs_scale = bool(actions & {"measure_weight", "tare_scale"})
     needs_camera = "capture_and_save" in actions
-    return sorted(robot_ids), picus2_robots, needs_scale, needs_camera
+    needs_microscope = bool(actions & MICROSCOPE_ACTIONS)
+    return sorted(robot_ids), picus2_robots, needs_scale, needs_camera, needs_microscope
 
 
 def _fmt_params(step: dict) -> str:
@@ -286,8 +299,8 @@ async def run(args) -> int:
         logger.error("ステップが空です")
         return 2
 
-    robot_ids, picus2_robots, needs_scale, needs_camera = plan_resources(steps)
-    needs_shared = needs_scale or needs_camera
+    robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope = plan_resources(steps)
+    needs_shared = needs_scale or needs_camera or needs_microscope
     robot_ports, shared_config = resolve_ports(args)
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
@@ -310,7 +323,8 @@ async def run(args) -> int:
     if picus2_robots:
         logger.info(f"ピペット使用: Robot {sorted(picus2_robots)}")
     if needs_shared:
-        parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera)) if need]
+        parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera),
+                                   ("顕微鏡", needs_microscope)) if need]
         logger.info(f"共有デバイス: {', '.join(parts)}")
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
@@ -345,7 +359,8 @@ async def run(args) -> int:
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
         if needs_shared:
-            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera)
+            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
+                                     use_microscope=needs_microscope)
 
         logger.info("=== フロー実行開始 ===")
         total = len(steps)
@@ -361,6 +376,8 @@ async def run(args) -> int:
             # 撮影画像は実験フォルダ内に束ねる（file_path 未指定の場合のみ）
             if action == "capture_and_save" and not step.get("file_path"):
                 step = {**step, "file_path": exp_logger.next_image_path(i)}
+            elif action == "capture_microscope" and not step.get("file_path"):
+                step = {**step, "file_path": exp_logger.next_image_path(i, tag="microscope")}
 
             iteration = step.get("_iteration")
             t_start = time.monotonic()

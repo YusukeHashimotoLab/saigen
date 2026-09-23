@@ -80,6 +80,11 @@ SYSTEM_PROMPT = """
 ### カメラ操作（Webcam）※共有デバイスのためrobot_id不要
 - capture_and_save: {"action": "capture_and_save", "file_path": "captured_images/image.jpg"}
 
+### デジタル顕微鏡操作（USB 顕微鏡, 例: 400-CAM106）※共有デバイスのためrobot_id不要
+- capture_microscope: {"action": "capture_microscope", "file_path": ""} (顕微鏡で撮影。file_path 空欄で自動生成)
+- microscope_led: {"action": "microscope_led", "on": true, "level": 12} (顕微鏡の LED 照明。on: true=点灯/false=消灯, level: 明るさ 0-255 省略可)
+- microscope_focus: {"action": "microscope_focus", "mode": "auto", "timeout": 60.0} (顕微鏡の焦点合わせ。mode: "auto"=ワンショットAF / "position"=レンズ位置指定 (position: 0-65535) / "step"=ステップ移動 (direction: "in"/"out", steps))
+
 ### 電子天秤操作（BCE8221）※共有デバイスのためrobot_id不要
 - measure_weight: {"action": "measure_weight", "stabilization_count": 3} (重量測定)
 - tare_scale: {"action": "tare_scale", "delay": 1.0} (風袋引き)

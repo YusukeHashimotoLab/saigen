@@ -388,7 +388,7 @@ async def run_two_solution_mixing(
     steps = expand_loops([s.model_dump() for s in workflow.steps])
     results = {"robot1_weight_g": None, "robot2_weight_g": None}
 
-    robot_ids, picus2_robots, needs_scale, needs_camera = run_flow.plan_resources(steps)
+    robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope = run_flow.plan_resources(steps)
 
     exp_logger = ExperimentLogger(
         workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR
@@ -447,8 +447,9 @@ async def run_two_solution_mixing(
     async def body():
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-        if needs_scale or needs_camera:
-            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera)
+        if needs_scale or needs_camera or needs_microscope:
+            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
+                                     use_microscope=needs_microscope)
 
         logger.info("=== two-solution mixing started ===")
         total = len(steps)

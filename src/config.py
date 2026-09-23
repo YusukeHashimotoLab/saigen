@@ -41,6 +41,9 @@ DEFAULTS = {
     "shared_devices": {
         "scale_port": "COM8",
         "camera_index": 0,
+        "microscope_index": 2,
+        "microscope_port": "",
+        "microscope_resolution": "3840x2160",
     },
     "workspace": {
         "x_min": -300.0, "x_max": 300.0,
@@ -142,7 +145,7 @@ def get_robot_ports() -> dict:
 
 
 def get_shared_devices() -> dict:
-    """Settings for the shared devices (scale_port, camera_index)."""
+    """Settings for the shared devices (scale_port, camera_index, microscope_index)."""
     return dict(load_config()["shared_devices"])
 
 

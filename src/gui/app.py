@@ -116,6 +116,18 @@ ACTION_CONFIG = {
         "icon": "📷", "label": "撮影", "category": "sensor",
         "defaults": {"file_path": ""}
     },
+    "capture_microscope": {
+        "icon": "🔬", "label": "顕微鏡撮影", "category": "sensor",
+        "defaults": {"file_path": ""}
+    },
+    "microscope_led": {
+        "icon": "💡", "label": "顕微鏡LED", "category": "sensor",
+        "defaults": {"on": True, "level": None}
+    },
+    "microscope_focus": {
+        "icon": "🎯", "label": "顕微鏡フォーカス", "category": "sensor",
+        "defaults": {"mode": "auto", "position": None, "direction": "in", "steps": 1, "timeout": 60.0}
+    },
     "measure_weight": {
         "icon": "⚖️", "label": "計測", "category": "sensor",
         "defaults": {"stabilization_count": 3}
@@ -149,7 +161,7 @@ CATEGORIES = {
     "robot": ("🤖 ロボット", ["move_xyz", "move_z", "move_radial", "rotate_relative", "go_home"]),
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "measure_weight", "tare_scale"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -678,6 +690,19 @@ def get_param_summary(step):
     elif action == "capture_and_save":
         path = step.get('file_path', '')
         return escape(path) if path else "(自動)"
+    elif action == "capture_microscope":
+        path = step.get('file_path', '')
+        return escape(path) if path else "(自動)"
+    elif action == "microscope_led":
+        lv = step.get('level')
+        return ("点灯" if step.get('on', True) else "消灯") + (f" 明るさ: {lv}" if lv is not None else "")
+    elif action == "microscope_focus":
+        mode = step.get('mode', 'auto')
+        if mode == "position":
+            return f"位置指定: {step.get('position')}"
+        if mode == "step":
+            return f"ステップ {step.get('direction', 'in')} x{step.get('steps', 1)}"
+        return f"AF (最大 {step.get('timeout', 60.0)}秒)"
     elif action == "measure_weight":
         return f"測定: {step.get('stabilization_count', 3)}回"
     elif action == "tare_scale":
@@ -780,6 +805,39 @@ def render_step_params(step, idx):
     elif action == "capture_and_save":
         step["file_path"] = st.text_input("ファイルパス", value=str(step.get("file_path", "")), key=f"cap_path_{idx}",
                                           on_change=_update_step_param, args=(idx, "file_path", f"cap_path_{idx}"))
+
+    elif action == "capture_microscope":
+        step["file_path"] = st.text_input("ファイルパス", value=str(step.get("file_path", "")), key=f"micro_path_{idx}",
+                                          on_change=_update_step_param, args=(idx, "file_path", f"micro_path_{idx}"))
+
+    elif action == "microscope_led":
+        step["on"] = st.checkbox("点灯する", value=bool(step.get("on", True)), key=f"mled_on_{idx}",
+                                 on_change=_update_step_param, args=(idx, "on", f"mled_on_{idx}"))
+        set_level = st.checkbox("明るさも設定する", value=step.get("level") is not None, key=f"mled_setlv_{idx}")
+        if set_level:
+            step["level"] = st.number_input("明るさ (0-255、出荷時 12)", value=int(step.get("level") or 12),
+                                            min_value=0, max_value=255, key=f"mled_lv_{idx}",
+                                            on_change=_update_step_param, args=(idx, "level", f"mled_lv_{idx}"))
+        else:
+            step["level"] = None
+
+    elif action == "microscope_focus":
+        modes = ["auto", "position", "step"]
+        step["mode"] = st.selectbox("モード", modes, index=modes.index(step.get("mode", "auto")), key=f"mf_mode_{idx}",
+                                    on_change=_update_step_param, args=(idx, "mode", f"mf_mode_{idx}"))
+        if step["mode"] == "position":
+            step["position"] = st.number_input("レンズ位置 (0-65535)", value=int(step.get("position") or 1568),
+                                               min_value=0, max_value=65535, key=f"mf_pos_{idx}",
+                                               on_change=_update_step_param, args=(idx, "position", f"mf_pos_{idx}"))
+        elif step["mode"] == "step":
+            dirs = ["in", "out"]
+            step["direction"] = st.selectbox("方向", dirs, index=dirs.index(step.get("direction", "in")), key=f"mf_dir_{idx}",
+                                             on_change=_update_step_param, args=(idx, "direction", f"mf_dir_{idx}"))
+            step["steps"] = st.number_input("回数", value=int(step.get("steps", 1)), min_value=1, max_value=100, key=f"mf_steps_{idx}",
+                                            on_change=_update_step_param, args=(idx, "steps", f"mf_steps_{idx}"))
+        step["timeout"] = st.number_input("待機上限(秒)", value=float(step.get("timeout", 60.0)), min_value=1.0, max_value=300.0,
+                                          step=5.0, key=f"mf_to_{idx}",
+                                          on_change=_update_step_param, args=(idx, "timeout", f"mf_to_{idx}"))
 
     elif action == "measure_weight":
         step["stabilization_count"] = st.number_input("測定回数", value=int(step.get("stabilization_count", 3)),

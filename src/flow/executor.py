@@ -23,7 +23,9 @@ logging.basicConfig(
 _default_logger = logging.getLogger(__name__)
 
 # 共有デバイス用アクション（robot_idに依存しない）
-SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save"}
+SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
+                         "capture_microscope", "microscope_led", "microscope_focus"}
+MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 
 # ループ制御アクション（実行時にスキップ）
 LOOP_CONTROL_ACTIONS = {"loop_start", "loop_end"}
@@ -126,6 +128,33 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
             file_path = None
         saved_path = await shared_devices.capture_and_save(file_path)
         return {"image_path": saved_path}
+
+    # ===== デジタル顕微鏡操作 =====
+    elif action == "capture_microscope":
+        file_path = step.get("file_path") if isinstance(step, dict) else step.file_path
+        if not file_path:
+            file_path = None
+        saved_path = await shared_devices.capture_microscope(file_path)
+        return {"image_path": saved_path}
+
+    elif action == "microscope_led":
+        on = step.get("on", True) if isinstance(step, dict) else step.on
+        level = step.get("level") if isinstance(step, dict) else step.level
+        state = await shared_devices.set_microscope_led(on, level)
+        logger.info(f"  顕微鏡 LED: {'ON' if state else 'OFF'}")
+        return None
+
+    elif action == "microscope_focus":
+        if isinstance(step, dict):
+            kwargs = {k: step.get(k) for k in ("mode", "position", "direction", "steps", "timeout")
+                      if step.get(k) is not None}
+        else:
+            kwargs = {"mode": step.mode, "position": step.position, "direction": step.direction,
+                      "steps": step.steps, "timeout": step.timeout}
+        result = await shared_devices.focus_microscope(**kwargs)
+        logger.info(f"  顕微鏡フォーカス: 位置 {result.get('focus_position')} "
+                    f"({'収束' if result.get('focus_converged') else '未収束'})")
+        return result
 
     # ===== 電子天秤操作（BCE8221） =====
     elif action == "measure_weight":
@@ -310,6 +339,7 @@ async def execute_workflow(json_path: str, robot_settings: dict = None, shared_s
     needs_shared_devices = bool(actions_in_workflow & SHARED_DEVICE_ACTIONS)
     needs_scale = "measure_weight" in actions_in_workflow or "tare_scale" in actions_in_workflow
     needs_camera = "capture_and_save" in actions_in_workflow
+    needs_microscope = bool(actions_in_workflow & MICROSCOPE_ACTIONS)
 
     # 4. LabRobot初期化 & 実行ループ
     async with LabRobot(use_dobot=True, **robot_settings) as robot:
@@ -319,6 +349,7 @@ async def execute_workflow(json_path: str, robot_settings: dict = None, shared_s
             shared_devices = SharedDevices(
                 use_scale=needs_scale,
                 use_camera=needs_camera,
+                use_microscope=needs_microscope,
                 **shared_settings
             )
             if not await shared_devices.initialize():

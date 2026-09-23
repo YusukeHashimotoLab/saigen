@@ -15,6 +15,8 @@ See [`bom.md`](bom.md) for the full list. The minimum for the ZIF-8 demonstratio
 - 2 × hot-plate stirrer (IKA RET control-visc, or a cheaper IKA plate with the same
   NAMUR serial interface such as the IKA Plate (RCT digital); see `bom.md`) — optional, RS-232C/USB
 - 1 × USB webcam
+- 1 × USB digital microscope (Sanwa Supply 400-CAM106 or any UVC microscope) — optional,
+  used by the `capture_microscope` step
 - 3D-printed fixtures from `cad/` (pipette holders on the arm tips, flask holders,
   balance splash guard)
 
@@ -60,7 +62,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id` |
-| `shared_devices` | `scale_port` and `camera_index` of the balance and the photo camera |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -75,7 +77,7 @@ Edit `.env`:
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
 | `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT` | optional per-run override of the `config.yaml` robot ports |
-| `SCALE_PORT`, `CAMERA_INDEX` | optional per-run override of the shared devices |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the
@@ -231,4 +233,20 @@ and the network settings are described in `src/monitoring/README.md`.
 - **`WorkspaceViolationError`** — the target is outside the configured box; adjust the
   flow, or the `workspace` section of `config.yaml`. The message names the axis, the
   target value and the limit it broke.
-- **Camera index** — enumeration order differs between machines; try 0, 1, 2.
+- **Camera index** — enumeration order differs between machines; try 0, 1, 2. On
+  Windows, `python -m src.devices.microscope.microscope_controller` prints the
+  DirectShow device names in index order, so the webcam and the microscope can be
+  told apart (the 400-CAM106 shows up as "UVC Video Device", VID `EB1A`).
+- **Microscope image is a single flat colour** — the lens cap is on, the tip is
+  pressed against the sample, or the LED ring is off; the driver logs a warning
+  in that case but still saves the frame.
+- **Microscope image has a strong green cast** — after power-up the 400-CAM106
+  applies no white-balance gains until the host writes the UVC white-balance
+  control once. `MicroscopeController.connect()` does that (5000 K, through
+  DirectShow on Windows), so use the saigen driver rather than a plain OpenCV
+  capture; the vendor viewer's *Connect* button has the same effect.
+- **Microscope LED does nothing** — `microscope_led` needs `microscope_port`: the
+  400-CAM106 exposes a second device, a Silicon Labs CP210x serial port (VID
+  `10C4`, S/N `0001`), on the same USB cable. Set that COM port in `config.yaml`.
+  Do not run the vendor's UM Viewer during an experiment: on *Connect* it writes
+  to every COM port on the PC, including the robots, pipettes and balance.

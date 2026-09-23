@@ -48,3 +48,4 @@ src/monitoring/config.yaml
 # Runtime output of flow runs and monitoring
 experiment_data/
 captured_images/
+microscope_images/

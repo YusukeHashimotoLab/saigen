@@ -1,0 +1,14 @@
+{
+  "name": "Product close-up with the USB digital microscope",
+  "description": "Switch the microscope's LED ring on at a non-saturating level, run a single-shot autofocus, photograph the vial on the balance with the overhead webcam, take two close-ups of the product with the USB digital microscope (Sanwa Supply 400-CAM106 = Vitiny UM22, or any UVC microscope), switch the LED off again and send Robot 1 home. The shared-device steps carry no robot_id and the devices are opened only because they appear in the flow. Camera indices and the microscope's control port come from config.yaml (shared_devices.camera_index / microscope_index / microscope_port) or from --camera-index / --microscope-index / --microscope-port. The lens position after focusing is written to the focus_position column of measurements.csv; to reproduce a focus, replace the autofocus step by {\"action\": \"microscope_focus\", \"mode\": \"position\", \"position\": <recorded value>}. Without a microscope_port the microscope_led / microscope_focus steps fail before anything moves; remove them if your microscope has no serial control.",
+  "steps": [
+    {"action": "microscope_led", "on": true, "level": 4},
+    {"action": "microscope_focus", "mode": "auto", "timeout": 60.0},
+    {"action": "capture_and_save", "file_path": ""},
+    {"action": "capture_microscope", "file_path": ""},
+    {"action": "wait", "robot_id": 1, "seconds": 1.0},
+    {"action": "capture_microscope", "file_path": ""},
+    {"action": "microscope_led", "on": false},
+    {"action": "go_home", "robot_id": 1}
+  ]
+}

@@ -388,7 +388,7 @@ class FlowRunner:
 
         steps = self.steps
         total = len(steps)
-        robot_ids, picus2_robots, needs_scale, needs_camera = plan_resources(steps)
+        robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope = plan_resources(steps)
 
         exp_logger = ExperimentLogger(
             self.workflow.name,
@@ -435,8 +435,9 @@ class FlowRunner:
         async def body():
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-            if needs_scale or needs_camera:
-                await session.add_shared(use_scale=needs_scale, use_camera=needs_camera)
+            if needs_scale or needs_camera or needs_microscope:
+                await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
+                                         use_microscope=needs_microscope)
 
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop
@@ -451,6 +452,8 @@ class FlowRunner:
                 # Keep captured images inside the run folder (as run_flow does).
                 if action == "capture_and_save" and not step.get("file_path"):
                     step = {**step, "file_path": exp_logger.next_image_path(i)}
+                elif action == "capture_microscope" and not step.get("file_path"):
+                    step = {**step, "file_path": exp_logger.next_image_path(i, tag="microscope")}
 
                 logger.info(
                     "[%d/%d] %s: %s %s", i, total,

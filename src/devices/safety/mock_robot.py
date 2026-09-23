@@ -236,17 +236,24 @@ class MockSharedDevices:
 
     MockLabRobot と対になる共有デバイス側のモック。実機を持たない環境でも
     measurements.csv / summary.md が実行時と同じ形で埋まるように、
-    ``measure_weight`` は float を、``capture_and_save`` は保存先パス文字列を
-    返す（None を返すと記録が空になり、記録経路のバグに気付けない）。
+    ``measure_weight`` は float を、``capture_and_save`` / ``capture_microscope``
+    は保存先パス文字列を返す（None を返すと記録が空になり、記録経路のバグに
+    気付けない）。
     """
 
     #: measure_weight が返すモック測定値 (g)
     MOCK_WEIGHT = 4.98
 
-    def __init__(self, use_scale: bool = False, use_camera: bool = False, **_ignored):
+    def __init__(self, use_scale: bool = False, use_camera: bool = False,
+                 use_microscope: bool = False, **_ignored):
         self.use_scale = use_scale
         self.use_camera = use_camera
+        self.use_microscope = use_microscope
         self._captures = 0
+        self._microscope_captures = 0
+        self.microscope_led_on = True
+        self.microscope_led_level = 12
+        self.microscope_focus_position = 1568   # 実機の出荷時レンズ位置
 
     async def initialize(self) -> bool:
         logger.info("=== [MOCK] 共有デバイス初期化 (成功) ===")
@@ -270,6 +277,41 @@ class MockSharedDevices:
         await asyncio.sleep(0.1)
         logger.info(f"✓ [MOCK] 画像キャプチャ・保存完了: {path}")
         return path
+
+    async def capture_microscope(self, file_path: Optional[str] = None) -> str:
+        self._microscope_captures += 1
+        path = file_path or f"microscope_images/mock_microscope_{self._microscope_captures:03d}.jpg"
+        logger.info(f"[MOCK] 顕微鏡画像キャプチャ・保存中: {path}")
+        await asyncio.sleep(0.1)
+        logger.info(f"✓ [MOCK] 顕微鏡画像キャプチャ・保存完了: {path}")
+        return path
+
+    async def set_microscope_led(self, on: bool = True, level: Optional[int] = None) -> bool:
+        if level is not None:
+            self.microscope_led_level = int(level)
+        self.microscope_led_on = bool(on)
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] 顕微鏡 LED {'ON' if on else 'OFF'}"
+                    + (f" (level {level})" if level is not None else ""))
+        return self.microscope_led_on
+
+    async def focus_microscope(self, mode: str = "auto", position: Optional[int] = None,
+                               direction: str = "in", steps: int = 1,
+                               timeout: float = 60.0) -> dict:
+        if mode == "auto":
+            self.microscope_focus_position = 1400
+        elif mode == "position":
+            if position is None:
+                raise ValueError("mode='position' には position が必要です")
+            self.microscope_focus_position = int(position)
+        elif mode == "step":
+            # 実機観測: "out" で位置の値が増え、"in" で減る（1 押し ≈ 14）
+            self.microscope_focus_position += (-14 if direction == "in" else 14) * int(steps)
+        else:
+            raise ValueError(f"unknown focus mode: {mode!r}")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] 顕微鏡フォーカス {mode}: レンズ位置 {self.microscope_focus_position}")
+        return {"focus_position": self.microscope_focus_position, "focus_converged": True}
 
     async def cleanup(self):
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")

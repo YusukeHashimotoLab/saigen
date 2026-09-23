@@ -119,6 +119,7 @@ class ExperimentLogger:
         weight = result.get("weight")
         image_path = result.get("image_path")
         nominal_time = result.get("nominal_time_s")
+        focus_position = result.get("focus_position")
 
         record = {
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -133,6 +134,7 @@ class ExperimentLogger:
             "weight_g": f"{weight:.3f}" if isinstance(weight, (int, float)) else "",
             "nominal_time_s": f"{nominal_time:.2f}" if isinstance(nominal_time, (int, float)) else "",
             "image_path": image_path or "",
+            "focus_position": str(focus_position) if isinstance(focus_position, int) else "",
             "error": error or "",
         }
         self.records.append(record)
@@ -151,10 +153,13 @@ class ExperimentLogger:
                 "step_index": index, "iteration": record["iteration"],
             })
 
-    def next_image_path(self, index):
-        """capture_and_save 用の保存先パスを払い出す（画像をフォルダ内へ束ねる）"""
+    def next_image_path(self, index, tag: str = ""):
+        """capture_and_save / capture_microscope 用の保存先パスを払い出す
+        （画像をフォルダ内へ束ねる）。``tag`` はファイル名に挟む識別子
+        （顕微鏡画像は "microscope"）。"""
         ts = datetime.now().strftime("%H%M%S")
-        filename = f"step{index:03d}_{ts}.jpg"
+        middle = f"_{tag}" if tag else ""
+        filename = f"step{index:03d}{middle}_{ts}.jpg"
         return os.path.join(self.images_dir, filename)
 
     # ------------------------------------------------------------------
@@ -183,7 +188,7 @@ class ExperimentLogger:
     def _write_csv(self):
         fields = ["timestamp", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
-                  "weight_g", "nominal_time_s", "image_path", "error"]
+                  "weight_g", "nominal_time_s", "image_path", "focus_position", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -291,6 +296,8 @@ class ExperimentLogger:
                 note = f"{r['weight_g']} g"
             elif r["image_path"]:
                 note = os.path.basename(r["image_path"])
+            elif r.get("focus_position"):
+                note = f"lens {r['focus_position']}"
             elif r["error"]:
                 note = f"⚠️ {r['error']}"
             state = "✅" if r["status"] == "ok" else "❌"

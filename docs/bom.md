@@ -14,6 +14,7 @@ per-device and can be adapted.
 | Electronic balance | Sartorius BCE822i-1SJP | 1 | Capacity 820 g, readability 0.01 g |
 | Web camera (process monitoring) | Logitech C920n | 1 | Fixed above the system |
 | Web camera (appearance imaging) | Logitech C920n | 1 | Part of the imaging system (`src/imaging/`) |
+| USB digital microscope | Sanwa Supply 400-CAM106 (a Vitiny UM22) | 1 | Close-up photos of the product (`capture_microscope`) and LED on/off/brightness (`microscope_led`). One USB cable: UVC camera + CP210x serial for the control MCU. Optional |
 | Light | NEEWER RGB62 | 1 | White/red/green/blue illumination, controlled over Bluetooth LE (`src/imaging/`) |
 | IoT sensor board | Raspberry Pi Zero WH + Waveshare Environment Sensor HAT | 1 | Temperature, humidity, illuminance, UV, VOC, 3-axis acceleration and angular velocity (magnetometer not read; see `src/monitoring/README.md`) |
 | Control PC | — | 1 | Connects to all devices via Wi-Fi or USB |

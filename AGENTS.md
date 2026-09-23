@@ -36,6 +36,7 @@ configuration and flow files, not in the driver code.
 | `src/imaging/` | Appearance-imaging system (light + camera), separate README. |
 | `detection/` | YOLOv8 object detection. **AGPL-3.0**, isolated on purpose; never import it from `src/`. |
 | `examples/zif8/` | Example flows of the paper's ZIF-8 demonstration. |
+| `examples/microscope/` | Example flow using the USB digital microscope (`capture_microscope`). |
 | `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument. |
 | `tests/`, `src/monitoring/tests/` | Unit tests; none need hardware. |
 
