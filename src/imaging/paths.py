@@ -13,6 +13,20 @@ never to the current working directory; only `IMAGING_DATA_DIR` moves them.
     UVC_UTIL          (env var)  path to the `uvc-util` binary used for camera
                                  control on macOS. Default: `uvc-util` on PATH,
                                  falling back to <module dir>/bin/uvc-util.
+    IMAGING_SERVER_URL (env var) base URL of the running camera_server.py that
+                                 acquire.py talks to. camera_server.py sets it
+                                 for the acquisition child it launches, so a
+                                 server started with --port N is always found.
+                                 Default: http://127.0.0.1:8799.
+    NEEWER_DEVICE_ID  (env var or repo-root .env) optional identifier of the
+                                 NEEWER light to use when more than one is in
+                                 range (see neewer_light.py). Read with
+                                 env_setting(), never written anywhere.
+
+A relative IMAGING_DATA_DIR is resolved once, against the directory the
+process was started from; camera_server.py passes the *resolved* absolute
+path to the acquisition child (which runs with cwd = this module's
+directory), so both processes always agree on one data root.
 """
 import os
 import shutil
@@ -31,6 +45,50 @@ OUT_DIR = DATA_DIR / "analysis"        # per-run analysis output (spectral_<time
 CAMERA_REFERENCE = CONFIG_DIR / "camera_reference.json"
 CAMERA_LOCAL = CONFIG_DIR / "camera_local.json"       # per-PC camera selection (git-ignored)
 LIGHT_REFERENCE = CONFIG_DIR / "light_reference.json"
+
+# Measurement-sequence lock (held by acquire.py for a whole run) and the
+# owner token the running acquisition writes next to it. While the lock is
+# held, camera_server.py accepts /api/control writes only when they carry
+# this token (header RUN_TOKEN_HEADER), so the Camera tab cannot change a
+# setting in the middle of a run.
+SPECTRAL_LOCK = OUT_DIR / ".spectral.lock"
+RUN_OWNER_PATH = OUT_DIR / ".spectral.owner"
+RUN_TOKEN_HEADER = "X-Imaging-Run-Token"
+
+DEFAULT_SERVER_URL = "http://127.0.0.1:8799"
+
+
+def server_url() -> str:
+    """Base URL of the camera server (IMAGING_SERVER_URL, else the default)."""
+    return (os.environ.get("IMAGING_SERVER_URL") or DEFAULT_SERVER_URL).rstrip("/")
+
+
+def env_setting(name: str, env_file: Path | None = None) -> str | None:
+    """Return a setting from the environment, else from the repo-root `.env`.
+
+    `.env` is parsed read-only (python-dotenv if installed, otherwise a
+    minimal KEY=VALUE reader); nothing is exported into os.environ. Empty
+    values count as unset.
+    """
+    v = os.environ.get(name)
+    if v and v.strip():
+        return v.strip()
+    env_file = REPO_ROOT / ".env" if env_file is None else env_file
+    if not env_file.is_file():
+        return None
+    try:
+        from dotenv import dotenv_values
+        v = dotenv_values(env_file).get(name)
+    except ImportError:
+        v = None
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, val = line.partition("=")
+            if k.strip().removeprefix("export ").strip() == name:
+                v = val.split(" #")[0].strip().strip("'\"")
+    return v.strip() if v and v.strip() else None
 
 
 def uvc_util_path() -> str:

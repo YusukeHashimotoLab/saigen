@@ -26,6 +26,7 @@ Logical control names and types:
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -404,6 +405,45 @@ class _WinCamera:
             self._cap.release()
 
 
+# One device row of `uvc-util -d`, e.g.
+#            0 0x046d:0x082d   0x14200000       1.00    HD Pro Webcam C920
+_UVC_ROW = re.compile(
+    r"^\s*(\d+)\s+0x[0-9a-fA-F]+:0x[0-9a-fA-F]+\s+\S+\s+\S+\s+(.+?)\s*$")
+
+
+def parse_uvc_device_list(text: str) -> list[dict]:
+    """Parse `uvc-util -d` output into [{"index": int, "name": str}]."""
+    out = []
+    for line in text.splitlines():
+        m = _UVC_ROW.match(line)
+        if m:
+            out.append({"index": int(m.group(1)), "name": m.group(2)})
+    return out
+
+
+def resolve_uvc_index(devices: list[dict], name: str) -> int:
+    """Pick the uvc-util index of the camera ffmpeg opens by `name`.
+
+    ffmpeg (AVFoundation) opens the camera by name, so uvc-util must
+    control that same camera; its index is not necessarily 0. Case-
+    insensitive substring match, like the Windows selector. Zero or
+    multiple matches are errors (never control a different camera than the
+    one being streamed).
+    """
+    matches = [d for d in devices if name.lower() in d["name"].lower()]
+    listing = [f"index {d['index']}: {d['name']}" for d in devices]
+    if not matches:
+        raise RuntimeError(
+            f"Camera '{name}' not found by uvc-util (detected: {listing}). "
+            f"Re-plug the camera and see README.md.")
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Camera name '{name}' matches several uvc-util devices "
+            f"({listing}); camera control would be ambiguous. Leave only "
+            f"one such camera connected.")
+    return matches[0]["index"]
+
+
 class _MacCamera:
     """Persistent ffmpeg (AVFoundation) + uvc-util control (existing macOS
     implementation)."""
@@ -440,7 +480,26 @@ class _MacCamera:
         self.cond = threading.Condition()
         self.proc: "subprocess.Popen | None" = None
         self.stream_settings: dict | None = None
+        # resolve which uvc-util index is the camera ffmpeg streams (by
+        # name) before anything reads or writes a control
+        self.uvc_index = self._resolve_uvc_index()
+        print(f"Camera selected: '{DEVICE_NAME}' (uvc-util index "
+              f"{self.uvc_index})", file=sys.stderr)
         threading.Thread(target=self._pump, daemon=True).start()
+
+    def _resolve_uvc_index(self) -> int:
+        import subprocess
+        try:
+            r = subprocess.run([self.UVC, "-d"], capture_output=True,
+                               text=True, timeout=10)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"uvc-util not found at {self.UVC}. Install it "
+                f"(https://github.com/jtfrey/uvc-util) and put it on PATH "
+                f"or set UVC_UTIL — see README.md")
+        if r.returncode != 0:
+            raise RuntimeError(f"uvc-util -d failed: {r.stderr.strip()}")
+        return resolve_uvc_index(parse_uvc_device_list(r.stdout), DEVICE_NAME)
 
     def _snapshot_settings(self) -> dict | None:
         """Measure and snapshot all 7 logical items (used for stale detection).
@@ -508,7 +567,7 @@ class _MacCamera:
     def _uvc(self, args):
         import subprocess
         try:
-            return subprocess.run([self.UVC, "-I", "0", *args],
+            return subprocess.run([self.UVC, "-I", str(self.uvc_index), *args],
                                   capture_output=True, text=True, timeout=10)
         except FileNotFoundError:
             raise RuntimeError(
@@ -536,8 +595,9 @@ class _MacCamera:
         return self.proc.pid if self.source_alive() else None
 
     def device_info(self) -> dict:
-        """macOS passes the name directly to ffmpeg (no index ambiguity)."""
-        return {"name": DEVICE_NAME, "index": None, "available": []}
+        """ffmpeg opens the camera by name; index is uvc-util's index of
+        that same camera (resolved by name at start-up)."""
+        return {"name": DEVICE_NAME, "index": self.uvc_index, "available": []}
 
     def shutdown(self) -> None:
         """Make sure the ffmpeg child process terminates (an orphaned

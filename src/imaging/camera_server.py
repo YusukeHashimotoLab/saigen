@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,6 +63,27 @@ WB_MIN, WB_MAX = 2000, 6500   # white balance color temperature (Kelvin)
 # immediately (starts the ffmpeg/DirectShow capture process), so importing
 # this module must not construct it.
 camera: "hw.CameraSource | None" = None
+
+# The base URL the acquisition child must call back on. Set in main() from
+# the actual --host/--port (a wildcard bind is reached via 127.0.0.1).
+server_url: str = paths.DEFAULT_SERVER_URL
+
+
+def _child_env() -> dict:
+    """Environment for the acquire.py child process.
+
+    - PYTHONIOENCODING: on Windows a piped child gets a locale (cp932)
+      stdout, which raises UnicodeEncodeError on acquire.py's non-ASCII
+      markers and kills the measurement.
+    - IMAGING_SERVER_URL: the port this server actually listens on (the
+      child would otherwise assume the default 8799).
+    - IMAGING_DATA_DIR: the *resolved* data root. The child runs with
+      cwd = the module directory, so a relative IMAGING_DATA_DIR inherited
+      as-is would resolve to a different directory there.
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8",
+            "IMAGING_SERVER_URL": server_url,
+            "IMAGING_DATA_DIR": str(paths.DATA_DIR)}
 
 
 def _kill_ffmpeg_child() -> None:
@@ -127,12 +149,9 @@ class SpectralJob:
                 return False
             self.lines = []
             self.result_dir = None
-            # Windows: a piped child process gets a locale (cp932) stdout,
-            # which raises UnicodeEncodeError on acquire.py's non-ASCII
-            # markers ("warning"/"ok" glyphs) and kills the measurement.
-            # Force the child to UTF-8 via PYTHONIOENCODING and read it back
-            # as UTF-8 in the parent too.
-            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+            # UTF-8 child output, the real server port and the resolved
+            # data root (see _child_env); read back as UTF-8 here too.
+            env = _child_env()
             self.proc = subprocess.Popen(
                 [sys.executable, "-u", str(paths.MODULE_DIR / "acquire.py"), *extra],
                 cwd=paths.MODULE_DIR, stdout=subprocess.PIPE,
@@ -190,7 +209,8 @@ class SpectralJob:
 
 spectral_job = SpectralJob()
 
-SPECTRAL_LOCK = paths.OUT_DIR / ".spectral.lock"
+SPECTRAL_LOCK = paths.SPECTRAL_LOCK
+RUN_OWNER_PATH = paths.RUN_OWNER_PATH
 GEOMETRY_LOCK = paths.OUT_DIR / "locked_geometry.json"
 CONDITIONS_DIR = paths.OUT_DIR / "conditions"
 _light_mutex = threading.Lock()  # serializes the BLE subprocess
@@ -239,6 +259,30 @@ def _measurement_idle() -> bool:
         return False
 
 
+def _run_owner_token() -> str | None:
+    """The owner token the running acquisition registered (None if absent)."""
+    try:
+        tok = RUN_OWNER_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return tok or None
+
+
+def control_write_allowed(token: str | None) -> bool:
+    """May a /api/control write go ahead?
+
+    Always while no measurement holds the lock. While one does, only a
+    write carrying that run's owner token is accepted (the run's own white
+    balance fix); anything else -- the Camera tab, a stray script -- is
+    refused, because a setting changed mid-run would silently change the
+    conditions of the photos still to be taken.
+    """
+    if _measurement_idle():
+        return True
+    owner = _run_owner_token()
+    return bool(token) and owner is not None and token == owner
+
+
 def _camera_snapshot() -> dict:
     """Read the current camera settings by logical name (None if unreadable)."""
     return {
@@ -251,26 +295,52 @@ def _camera_snapshot() -> dict:
     }
 
 
-def _apply_camera(saved: dict) -> bool:
-    """Apply a saved camera configuration via logical names (skip null entries).
+# preset/snapshot key -> hw logical name
+_SNAPSHOT_KEYS = {"exposure": "exposure", "gain": "gain", "focus": "focus",
+                  "wb": "wb_temp", "auto_exposure": "auto_exposure",
+                  "auto_focus": "auto_focus"}
+
+
+def _apply_camera(saved: dict) -> dict:
+    """Apply a saved camera configuration via logical names (skip null
+    entries), then read everything back and compare.
 
     Per the hard rule, white balance stays manual: only the temperature is
     changed, auto white balance is never re-enabled.
+
+    Returns {"ok", "failed_writes", "diff", "read_back"}: failed_writes
+    lists the logical names whose set() reported failure; diff lists every
+    requested value whose read-back differs ({"key", "requested",
+    "read_back"}). Entries the backend cannot read by design (not in
+    camera.readable_names, e.g. auto_exposure on DirectShow) are not
+    compared. ok is True only when every write succeeded and every
+    readable value reads back as requested.
     """
-    if saved.get("auto_exposure") is not None:
-        camera.set("auto_exposure", bool(saved["auto_exposure"]))
-    if saved.get("exposure") is not None:
-        camera.set("exposure", int(saved["exposure"]))
-    if saved.get("gain") is not None:
-        camera.set("gain", int(saved["gain"]))
-    if saved.get("auto_focus") is not None:
-        camera.set("auto_focus", bool(saved["auto_focus"]))
-    if saved.get("focus") is not None:
-        camera.set("focus", int(saved["focus"]))
+    plan = []   # (key reported in diff, logical name, value)
+    for key, conv in (("auto_exposure", bool), ("exposure", int),
+                      ("gain", int), ("auto_focus", bool), ("focus", int)):
+        if saved.get(key) is not None:
+            plan.append((key, _SNAPSHOT_KEYS[key], conv(saved[key])))
     if saved.get("wb") is not None:
-        camera.set("auto_wb", False)
-        camera.set("wb_temp", int(saved["wb"]))
-    return True
+        plan.append(("auto_wb", "auto_wb", False))
+        plan.append(("wb", "wb_temp", int(saved["wb"])))
+
+    failed = []
+    for _key, logical, value in plan:
+        if not camera.set(logical, value):
+            failed.append(logical)
+
+    read_back = _camera_snapshot()
+    readable = set(getattr(camera, "readable_names", hw.CONTROL_NAMES))
+    diff = []
+    for key, logical, value in plan:
+        if logical not in readable:
+            continue
+        actual = read_back[key] if key in read_back else camera.get(logical)
+        if actual != value:
+            diff.append({"key": key, "requested": value, "read_back": actual})
+    return {"ok": not failed and not diff, "failed_writes": failed,
+            "diff": diff, "read_back": read_back}
 
 
 def _light_args(light: dict) -> list[str]:
@@ -403,6 +473,29 @@ def _health_stream_stale(current_settings: dict) -> bool:
     return any(current_settings.get(key) != val for key, val in snap.items())
 
 
+def capture_name(now: datetime | None = None) -> str:
+    """A capture file name unique even for several shots per second:
+    timestamp to the millisecond plus a random suffix."""
+    now = now or datetime.now()
+    return (f"sample_{now.strftime('%Y%m%d_%H%M%S')}_"
+            f"{now.microsecond // 1000:03d}_{uuid.uuid4().hex[:8]}.jpg")
+
+
+def save_capture(frame: bytes, directory: Path | None = None) -> Path:
+    """Write a frame to a new file (exclusive create; never overwrites)."""
+    directory = paths.PHOTOS_DIR if directory is None else directory
+    directory.mkdir(parents=True, exist_ok=True)
+    for _ in range(5):
+        path = directory / capture_name()
+        try:
+            with path.open("xb") as fp:
+                fp.write(frame)
+            return path
+        except FileExistsError:
+            continue
+    raise OSError("Could not find a free capture file name")
+
+
 PHOTO_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".png": "image/png", ".csv": "text/csv; charset=utf-8",
                ".json": "application/json"}
@@ -504,6 +597,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _set_control(self, payload):
         name, value = payload.get("name"), payload.get("value")
+        if not control_write_allowed(self.headers.get(paths.RUN_TOKEN_HEADER)):
+            self._json({"ok": False,
+                        "error": "A measurement is running; camera controls "
+                                 "are locked until it finishes"}, 409)
+            return
         if name in SLIDERS:
             logical, lo, hi = SLIDERS[name]
             v = max(lo, min(hi, int(value)))
@@ -515,7 +613,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "value": v} if ok else {"ok": False}, 200 if ok else 500)
         elif name in BOOLS:
             ok = camera.set(BOOLS[name], bool(value))
-            self._json({"ok": ok})
+            self._json({"ok": ok, "value": bool(value)} if ok else {"ok": False},
+                       200 if ok else 500)
         else:
             self._json({"error": "unknown control"}, 400)
 
@@ -741,10 +840,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            applied_camera = _apply_camera(doc.get("camera") or {})
+            cam_result = _apply_camera(doc.get("camera") or {})
         except Exception as e:
             self._json({"error": f"Failed to apply the camera settings: {e}"}, 500)
             return
+        if not cam_result["ok"]:
+            # do not go on to the light/geometry: a half-applied preset
+            # must not look like a successful one
+            self._json({"error": "The camera did not accept the preset "
+                                 "(write failed or read-back differs)",
+                        "failed_writes": cam_result["failed_writes"],
+                        "diff": cam_result["diff"],
+                        "read_back": cam_result["read_back"]}, 500)
+            return
+        applied_camera = True
 
         applied_light = False
         if doc.get("light"):
@@ -771,14 +880,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": f"Failed to write back the frame: {e}"}, 500)
                 return
 
-        self._json({
+        try:
+            restart_required = _health_stream_stale(
+                {name: camera.get(name) for name in hw.CONTROL_NAMES})
+        except Exception:
+            restart_required = None
+        resp = {
             "ok": True,
             "applied": {"camera": applied_camera, "light": applied_light,
                        "geometry": applied_geometry},
-            "note": "Exposure etc. are not reflected in the live view immediately "
-                    "(they are reflected in measurement values). Restart this "
-                    "server to update the live view.",
-        })
+            "camera_read_back": cam_result["read_back"],
+            "restart_required": restart_required,
+        }
+        if restart_required:
+            # README rule 2: the running stream keeps the settings it was
+            # started with, and captured photos come from that stream, so
+            # neither the live view nor measurements see the change yet
+            # (acquire.py refuses to run until the server is restarted).
+            resp["note"] = ("The camera accepted the settings, but the running "
+                            "stream (live view AND captured photos) keeps its "
+                            "start-up settings. Restart this server before "
+                            "measuring.")
+        self._json(resp)
 
     def _conditions_verify(self, payload):
         name = str(payload.get("name") or "").strip()
@@ -826,9 +949,12 @@ class Handler(BaseHTTPRequestHandler):
         if frame is None or seq == cur:
             self._json({"error": "no fresh frame (stream dead?)"}, 503)
             return
-        name = datetime.now().strftime("sample_%Y%m%d_%H%M%S.jpg")
-        (paths.PHOTOS_DIR / name).write_bytes(frame)
-        self._json({"ok": True, "file": name})
+        try:
+            path = save_capture(frame)
+        except OSError as e:
+            self._json({"error": f"Failed to save the photo: {e}"}, 500)
+            return
+        self._json({"ok": True, "file": path.name, "path": str(path)})
 
     def _health(self):
         """Return the camera server's health status (for health-check
@@ -899,6 +1025,11 @@ def main():
                         help=f"port to listen on (default: {PORT})")
     args = parser.parse_args()
 
+    global server_url
+    host = "127.0.0.1" if args.host in ("", "0.0.0.0", "::") else args.host
+    if ":" in host:
+        host = f"[{host}]"
+    server_url = f"http://{host}:{args.port}"
     paths.ensure_dirs()
     camera = hw.CameraSource()
     server = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -48,9 +48,12 @@ from __future__ import annotations   # NeewerLight type hints stay strings (see 
 import argparse
 import csv
 import json
+import math
+import secrets
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +72,7 @@ if sys.platform == "win32":
             _s.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
+import paths
 from paths import OUT_DIR, PHOTOS_DIR, ensure_dirs
 
 # The hardware layer (`hw`, `neewer_light`, `capture`) is imported lazily,
@@ -117,7 +121,7 @@ WHITE_FIXED_DEFAULT = 20   # default white-only fixed intensity % (UI default / 
 # Exclusion lock for the measurement sequence. If a periodic capture loop and
 # a manual measurement run at the same time they fight over the light and
 # camera and both measurements break, so they must always be serialized.
-LOCK_PATH = OUT_DIR / ".spectral.lock"
+LOCK_PATH = paths.SPECTRAL_LOCK
 LOCK_WAIT_S = 300
 
 # Fixed field of view (locked geometry). When swapping samples for
@@ -280,7 +284,7 @@ def _white_geometry_from_fixed_shot(light: NeewerLight, run_dir: Path,
     return feat
 
 
-def _fix_white_balance() -> None:
+def _fix_white_balance() -> dict:
     """Fix the white balance to manual 4600 K (wait out the transition if it wasn't already fixed).
 
     Camera control goes through the server (the process that owns the
@@ -288,6 +292,11 @@ def _fix_white_balance() -> None:
     so this is the only available path (the same path also works on macOS).
     autoWhiteBalance is True=auto, whiteBalance is in Kelvin (both are the
     control names exposed by the camera server).
+
+    Every write is checked (capture.set_control raises on failure) and the
+    two values are read back afterwards; a read-back that differs from
+    manual/WB_FIXED raises RuntimeError. Returns the read-back values
+    {"autoWhiteBalance": ..., "whiteBalance": ...}.
     """
     from capture import get_control, set_control
 
@@ -299,6 +308,103 @@ def _fix_white_balance() -> None:
     if not already:
         print(f"Fixing WB: auto={wb_auto} temp={wb_temp} -> manual {WB_FIXED} (waiting for transition)")
         time.sleep(WB_SETTLE_S)
+    read_back = {"autoWhiteBalance": get_control("autoWhiteBalance"),
+                 "whiteBalance": get_control("whiteBalance")}
+    diff = {k: v for k, v in read_back.items()
+            if v != {"autoWhiteBalance": False, "whiteBalance": WB_FIXED}[k]}
+    if diff:
+        raise RuntimeError(
+            f"White balance did not stick: read back {read_back} "
+            f"(requested manual {WB_FIXED} K)")
+    return read_back
+
+
+def camera_preflight() -> dict:
+    """Query the camera server's /api/health and refuse to measure on a
+    stream that cannot be trusted.
+
+    Aborts (RuntimeError) when the stream is stale -- camera settings were
+    changed after the stream started, so frames still use the old ones
+    (README rule 2) -- or when there is no fresh frame / no live video
+    source / the controls cannot be read. A mismatch against
+    camera_reference.json does not abort (the reference depends on the
+    sample; see that file) but is returned and recorded in summary.json.
+
+    Returns the per-run camera record: the READ-BACK settings (logical
+    names), the device actually held open, and the reference comparison.
+    """
+    from capture import get_health
+
+    h = get_health()
+    if h.get("stream_settings_stale"):
+        raise RuntimeError(
+            "The camera stream is stale: settings were changed after the "
+            "stream started, so photos would still use the old ones. "
+            "Restart camera_server.py and try again (README rule 2).")
+    problems = []
+    if not (h.get("frame") or {}).get("fresh"):
+        problems.append("no fresh frame")
+    if not (h.get("ffmpeg") or {}).get("alive"):
+        problems.append("video source not running")
+    cam = h.get("camera") or {}
+    if not cam.get("connected"):
+        problems.append("camera controls unreadable")
+    if problems:
+        raise RuntimeError(f"Camera server not ready: {', '.join(problems)}")
+    if cam.get("matches_reference") is False:
+        print(f"  [warning] camera differs from camera_reference.json: "
+              f"{cam.get('mismatches')}")
+    return {"settings": cam.get("settings"),
+            "device": cam.get("device"),
+            "matches_reference": cam.get("matches_reference"),
+            "mismatches": cam.get("mismatches") or []}
+
+
+@contextmanager
+def run_owner():
+    """Register this run as the owner of the camera controls.
+
+    Must be entered while holding LOCK_PATH. Writes a random token to
+    paths.RUN_OWNER_PATH and attaches it to this process's control writes;
+    camera_server.py refuses /api/control writes without it while the lock
+    is held. The token file is removed on exit.
+    """
+    import capture
+
+    token = secrets.token_hex(16)
+    paths.RUN_OWNER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    paths.RUN_OWNER_PATH.write_text(token, encoding="utf-8")
+    capture.set_run_token(token)
+    try:
+        yield token
+    finally:
+        capture.set_run_token(None)
+        try:
+            if paths.RUN_OWNER_PATH.read_text(encoding="utf-8").strip() == token:
+                paths.RUN_OWNER_PATH.unlink()
+        except OSError:
+            pass
+
+
+def restore_light(light, restore: tuple[int, int]) -> str:
+    """Leave the light in the requested state and always close the handle.
+
+    Brightness 0 means off: dim first (so it is not blinding when next
+    powered on), then power off. Nested try/finally: power(False) runs
+    even if the dimming command fails, and close() runs even if both do;
+    the first error is re-raised afterwards.
+    """
+    try:
+        if restore[0] <= 0:
+            try:
+                light.set_cct(1, restore[1])
+            finally:
+                light.power(False)
+            return "off"
+        light.set_cct(*restore)
+        return f"CCT {restore[0]}%/{restore[1]}K"
+    finally:
+        light.close()
 
 
 def load_locked_geometry() -> dict:
@@ -322,7 +428,8 @@ def calibrate_geometry(restore: tuple[int, int] = (0, 5600)) -> int:
 
     with hw.file_lock(
             LOCK_PATH, LOCK_WAIT_S,
-            on_wait=lambda: print("Another measurement is running; waiting for it to finish...")):
+            on_wait=lambda: print("Another measurement is running; waiting for it to finish...")), \
+            run_owner():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         tmp = OUT_DIR / f".calib_{ts}"
         tmp.mkdir(parents=True, exist_ok=True)
@@ -333,15 +440,11 @@ def calibrate_geometry(restore: tuple[int, int] = (0, 5600)) -> int:
             light.set_cct(1, 5600)
             time.sleep(LED_SETTLE_S)
             _fix_white_balance()
+            camera_preflight()
             print("Capturing white reference (calibration)...")
             ref_path, geo, white_brt = capture_white_reference(light, tmp)
         finally:
-            if restore[0] <= 0:
-                light.set_cct(1, restore[1])
-                light.power(False)
-            else:
-                light.set_cct(*restore)
-            light.close()
+            restore_light(light, restore)
         body_w = geo["body"]["x1"] - geo["body"]["x0"]
         vial_w = geo["vial"]["x1"] - geo["vial"]["x0"]
         if body_w < 0.3 * vial_w:
@@ -422,6 +525,59 @@ def capture_color(light: NeewerLight, run_dir: Path, name: str, hue: int,
 
 # ---------------------------------------------------------------- analysis
 
+def _finite(v):
+    """float(v), or None if it is NaN/inf (summary.json must stay valid JSON)."""
+    if v is None:
+        return None
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
+def _od_curve(sig: np.ndarray, y_top: int, cut: float):
+    """OD = -log10(sig / I0) row by row until sig falls to the cut.
+
+    I0 = mean of the first 15 rows. Returns (ys, ods, extinct_y, i0). With
+    no usable I0 (i0 <= cut: the image is dark, or all signal is below the
+    pedestal) the curve is empty and extinct_y is y_top -- never NaN/inf.
+    """
+    i0 = float(sig[:15].mean()) if len(sig) else 0.0
+    if not math.isfinite(i0) or i0 <= cut:
+        return [], [], y_top, i0
+    ys, ods = [], []
+    extinct_y = None
+    for i, v in enumerate(sig):
+        if v <= cut:
+            extinct_y = y_top + i
+            break
+        ys.append(y_top + i)
+        ods.append(float(-np.log10(v / i0)))
+    return ys, ods, extinct_y, i0
+
+
+MIN_LIQUID_ROWS = 20
+
+
+def _check_bounds(geo: dict, h: int, w: int) -> None:
+    """Raise ValueError if the geometry does not fit the image."""
+    men_y = geo["meniscus"]["y"]
+    bottom = geo["liquid"]["bottom_y"] - 22
+    x0, x1 = geo["body"]["x0"], geo["body"]["x1"]
+    cap_y0 = geo["cap"]["y0"]
+    trim = (x1 - x0) * 20 // 100
+    problems = []
+    if not 0 <= cap_y0 < h:
+        problems.append(f"cap y0={cap_y0} outside 0..{h - 1}")
+    if not 0 <= men_y < h:
+        problems.append(f"meniscus y={men_y} outside 0..{h - 1}")
+    if not men_y + 8 + MIN_LIQUID_ROWS <= bottom <= h:
+        problems.append(f"liquid rows {men_y + 8}..{bottom} empty, too short "
+                        f"(< {MIN_LIQUID_ROWS}) or beyond the image height {h}")
+    if not (0 <= x0 < x1 <= w) or (x1 - trim) - (x0 + trim) < 1:
+        problems.append(f"body columns {x0}..{x1} invalid for width {w}")
+    if problems:
+        raise ValueError("Geometry does not fit the image: " + "; ".join(problems))
+
+
 def od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
     """Compute the depth-resolved OD from the secondary channel.
 
@@ -430,7 +586,20 @@ def od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
     signal pins to the flare floor, a "flat minimum-value window" within the
     liquid is instead adopted as the floor, and rows beyond where the signal
     reaches that floor are truncated (only a lower bound on OD is known there).
+
+    Returns ys/ods (the corrected profile), extinct_y, pedestal,
+    pedestal_mode ("cap" or "floor"), pedestal_rule ("cap", "flat_window"
+    or "min_then_rise": which rule set the pedestal), i0, and the
+    uncorrected profile ys_cap/ods_cap/i0_cap computed with the cap
+    pedestal alone (identical to ys/ods when pedestal_mode is "cap"), plus
+    warning (None or text). The min-then-rise rule is a heuristic, so a
+    warning is attached whenever it chose the floor. A uniformly dark
+    image gives empty curves and a warning, never NaN/inf. Geometry that
+    does not fit the image raises ValueError.
     """
+    rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
+    h, w = rgb.shape[:2]
+    _check_bounds(geo, h, w)
     men_y = geo["meniscus"]["y"]
     bottom = geo["liquid"]["bottom_y"] - 22     # exclude the bright band at the bottom
     x0, x1 = geo["body"]["x0"], geo["body"]["x1"]
@@ -440,7 +609,6 @@ def od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
     trim = (x1 - x0) * 20 // 100
     xi0, xi1 = x0 + trim, x1 - trim
 
-    rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
     lin = srgb_to_linear(rgb[:, xi0:xi1, sec_ch]).mean(axis=1)
     smooth = np.convolve(lin, np.ones(9) / 9, mode="same")
 
@@ -474,11 +642,12 @@ def od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
     #      stalls or reverses (the depth where stray light such as bottom
     #      glow starts to dominate)
     # are both treated as the flare/stray-light floor and adopted as the pedestal.
-    floor = None
+    floor, rule = None, None
     for s in range(0, len(liq) - 80, 20):
         win = liq[s:s + 80]
         if win.std() < 0.05 * win.mean() and win.mean() < 0.3 * (i0_raw + ped_cap):
-            floor = win.mean() if floor is None else min(floor, win.mean())
+            if floor is None or win.mean() < floor:
+                floor, rule = float(win.mean()), "flat_window"
     run_min = np.minimum.accumulate(liq)
     exceed = liq > run_min * 1.3
     count, onset = 0, None
@@ -488,24 +657,50 @@ def od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
             onset = i - 9
             break
     if onset is not None and run_min[onset] < 0.35 * (i0_raw + ped_cap):
-        floor = (float(run_min[onset]) if floor is None
-                 else max(floor, float(run_min[onset])))
-    ped = floor if (floor is not None and floor > 2 * ped_cap) else ped_cap
+        if floor is None or float(run_min[onset]) > floor:
+            floor, rule = float(run_min[onset]), "min_then_rise"
+    use_floor = floor is not None and floor > 2 * ped_cap
+    ped = floor if use_floor else ped_cap
+    rule = rule if use_floor else "cap"
 
-    sig = liq - ped
-    i0 = float(sig[:15].mean())
-    cut = max(0.35 * ped, 1e-4)
-    ys, ods = [], []
-    extinct_y = None
-    for i, s in enumerate(sig):
-        if s <= cut:
-            extinct_y = y_top + i
-            break
-        ys.append(y_top + i)
-        ods.append(float(-np.log10(s / i0)))
+    warnings = []
+    ys, ods, extinct_y, i0 = _od_curve(liq - ped, y_top, max(0.35 * ped, 1e-4))
+    ys_cap, ods_cap, _ext_cap, i0_cap = _od_curve(
+        liq - ped_cap, y_top, max(0.35 * ped_cap, 1e-4))
+    if not ys:
+        warnings.append(f"No transmitted signal above the pedestal "
+                        f"(I0={i0:.3g}, pedestal={ped:.3g}); profile is empty")
+    if rule == "min_then_rise":
+        warnings.append(
+            f"Pedestal chosen by the minimum-then-rise rule (floor at "
+            f"y={y_top + onset}); the floor choice is heuristic and OD past "
+            f"it is a lower bound -- compare with the cap-pedestal profile")
     return {"ys": ys, "ods": ods, "extinct_y": extinct_y,
-            "pedestal": float(ped), "pedestal_mode": "floor" if ped != ped_cap else "cap",
-            "i0": i0}
+            "pedestal": _finite(ped),
+            "pedestal_mode": "floor" if use_floor else "cap",
+            "pedestal_rule": rule,
+            "i0": _finite(i0),
+            "ys_cap": ys_cap, "ods_cap": ods_cap, "i0_cap": _finite(i0_cap),
+            "pedestal_cap": _finite(ped_cap),
+            "warning": "; ".join(warnings) or None}
+
+
+def _empty_profile(reason: str) -> dict:
+    """Profile placeholder when od_profile cannot run (e.g. bad geometry)."""
+    return {"ys": [], "ods": [], "extinct_y": None, "pedestal": None,
+            "pedestal_mode": None, "pedestal_rule": None, "i0": None,
+            "ys_cap": [], "ods_cap": [], "i0_cap": None, "pedestal_cap": None,
+            "warning": reason}
+
+
+def safe_od_profile(path: Path, sec_ch: int, geo: dict) -> dict:
+    """od_profile, but a geometry that does not fit the image gives an empty
+    profile with a warning instead of aborting the run (the photos are
+    already taken; summary.json must still be written)."""
+    try:
+        return od_profile(path, sec_ch, geo)
+    except ValueError as e:
+        return _empty_profile(str(e))
 
 
 def white_headspace_stats(
@@ -579,7 +774,8 @@ def draw_figure(run_dir: Path, results: list[dict], geo: dict,
     d = ImageDraw.Draw(img)
     FG, DIM, GRID = (225, 225, 225), (150, 154, 162), (70, 74, 82)
     OD_MAX = 1.0
-    y_top = min(r["profile"]["ys"][0] for r in results)
+    starts = [r["profile"]["ys"][0] for r in results if r["profile"]["ys"]]
+    y_top = min(starts) if starts else geo["meniscus"]["y"] + 8
     y_bot = geo["liquid"]["bottom_y"] - 22
 
     if mode == "white":
@@ -687,7 +883,7 @@ def run_spectral(start_intensity: int = 1,
                          f"{white_intensity}")
     with hw.file_lock(
             LOCK_PATH, LOCK_WAIT_S,
-            on_wait=lambda: print("Another measurement is running; waiting for it to finish...")):
+            on_wait=lambda: print("Another measurement is running; waiting for it to finish...")),             run_owner():
         return _run_locked(start_intensity, restore, run_dir, mode, locked_geo,
                            fixed_intensity, white_intensity)
 
@@ -712,6 +908,7 @@ def _run_locked(start_intensity: int, restore: tuple[int, int],
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Light: {light.name}")
     results = []
+    camera_before = camera_after = None
     try:
         # power on under white first, then fix WB and wait for the
         # transition. If it is already at manual 4600, nothing changes (WB
@@ -720,6 +917,9 @@ def _run_locked(start_intensity: int, restore: tuple[int, int],
         light.set_cct(1, 5600)
         time.sleep(LED_SETTLE_S)
         _fix_white_balance()
+        # the server must confirm the stream is not stale before any photo
+        # is taken; its read-back settings are this run's camera record
+        camera_before = camera_preflight()
         if white_intensity is not None:
             # white-only fixed intensity: the photometry target
             # (ref_white.jpg) is always the image captured at this exact
@@ -793,7 +993,7 @@ def _run_locked(start_intensity: int, restore: tuple[int, int],
                     # check above)
                     warn = (f"White intensity {white_brt}% is too dim "
                             f"(channel mean={mean:.1f}) -- the lower OD range may be lost")
-                prof = od_profile(ref_path, ch, geo)
+                prof = safe_od_profile(ref_path, ch, geo)
                 results.append({"name": f"white_{'RGB'[ch]}",
                                 "label": "RGB"[ch], "wavelength_nm": None,
                                 "channel": "RGB"[ch],
@@ -806,77 +1006,140 @@ def _run_locked(start_intensity: int, restore: tuple[int, int],
                 photo, used, warn = capture_color(light, run_dir, name, hue,
                                                   dom_ch, sec_ch, geo, intensity,
                                                   fixed=fixed_intensity)
-                prof = od_profile(photo, sec_ch, geo)
+                prof = safe_od_profile(photo, sec_ch, geo)
                 results.append({"name": name, "label": str(wl),
                                 "wavelength_nm": wl,
                                 "channel": "RGB"[sec_ch], "intensity_pct": used,
                                 "photo": photo, "profile": prof, "color": color,
                                 "warning": warn})
                 intensity = used  # the next color starts from this intensity
+        # read the settings back once more after the last photo, so a
+        # change during the run is visible in summary.json
+        try:
+            camera_after = camera_preflight()
+        except Exception as e:     # recorded, not fatal: the photos exist
+            camera_after = {"error": str(e)}
     finally:
-        if restore[0] <= 0:
-            light.set_cct(1, restore[1])   # dim it first so it isn't blinding next time it powers on
-            light.power(False)
-            restored = "off"
-        else:
-            light.set_cct(*restore)
-            restored = f"CCT {restore[0]}%/{restore[1]}K"
-        light.close()
+        restored = restore_light(light, restore)
         # WB is kept at manual 4600, never switched back to auto (for color reproducibility)
         print(f"Restore: light {restored}, WB kept at manual {WB_FIXED}")
 
+    return write_run_outputs(
+        run_dir, results, geo, mode, ts,
+        extra={
+            "geometry_locked": locked_geo is not None,
+            "fixed_intensity": bool(fixed_intensity),
+            "white_intensity_pct": white_brt,
+            "white_intensity_fixed": white_intensity is not None,
+            # ref_white.jpg's headspace band (a measured probe of effective
+            # intensity). mean: R/G/B average, clip: saturated-pixel
+            # fraction, px: band height. px<5 suggests broken geometry
+            # detection, in which case mean/clip are null (see README.md).
+            "white_headspace_mean": headspace_mean,
+            "white_headspace_clip": headspace_clip,
+            "white_headspace_px": headspace_px,
+        },
+        camera_before=camera_before, camera_after=camera_after,
+        named=named)
+
+
+def camera_record(before: dict | None, after: dict | None) -> dict:
+    """summary.json fields for the camera, from READ-BACK values only.
+
+    camera_settings is what the server read back from the device right
+    before the first photo (None = unknown); camera_settings_changed is
+    True when the post-run read-back differs.
+    """
+    rec = {"camera_settings": (before or {}).get("settings"),
+           "camera_device": (before or {}).get("device"),
+           "camera_matches_reference": (before or {}).get("matches_reference"),
+           "camera_mismatches": (before or {}).get("mismatches")}
+    if after is not None:
+        rec["camera_settings_after"] = after.get("settings")
+        if "error" in after:
+            rec["camera_settings_after_error"] = after["error"]
+        changed = None
+        if rec["camera_settings"] is not None and after.get("settings") is not None:
+            changed = after["settings"] != rec["camera_settings"]
+        rec["camera_settings_changed"] = changed
+    return rec
+
+
+def write_run_outputs(run_dir: Path, results: list[dict], geo: dict,
+                      mode: str, ts: str, extra: dict | None = None,
+                      camera_before: dict | None = None,
+                      camera_after: dict | None = None,
+                      named: bool = False) -> int:
+    """Write profiles.csv and summary.json, then the figure.
+
+    summary.json is written before plotting, so a failure while drawing
+    never loses the record. Empty profiles (dark images, geometry outside
+    the image) are allowed: their columns are simply empty. NaN/inf are
+    never written (json allow_nan=False enforces it).
+    """
     # the sedimentation front is read from the red-side attenuation (full
     # mode: 625 nm, white-only mode: R channel)
-    front_y = sediment_front(results[0]["profile"])
+    front_y = sediment_front(results[0]["profile"]) if results else None
 
-    # profiles.csv (column names: full mode od_625... / white-only mode od_R...)
-    y_min = min(r["profile"]["ys"][0] for r in results)
-    y_max = max(r["profile"]["ys"][-1] for r in results)
+    # profiles.csv (column names: full mode od_625... / white-only mode
+    # od_R...), each followed by od_<label>_cap = the uncorrected profile
+    # computed with the cap pedestal alone
+    all_ys = [y for r in results
+              for y in r["profile"]["ys"] + r["profile"].get("ys_cap", [])]
     lut = {r["label"]: dict(zip(r["profile"]["ys"], r["profile"]["ods"]))
            for r in results}
+    lut_cap = {r["label"]: dict(zip(r["profile"].get("ys_cap", []),
+                                    r["profile"].get("ods_cap", [])))
+               for r in results}
+    header = ["y", "depth_px"]
+    for r in results:
+        header += [f"od_{r['label']}", f"od_{r['label']}_cap"]
     with (run_dir / "profiles.csv").open("w", newline="",
                                         encoding="utf-8") as fp:
         w = csv.writer(fp)
-        w.writerow(["y", "depth_px"] + [f"od_{r['label']}" for r in results])
-        for y in range(y_min, y_max + 1):
-            row = [y, y - y_min]
-            for r in results:
-                od = lut[r["label"]].get(y)
-                row.append(f"{od:.4f}" if od is not None else "")
-            w.writerow(row)
+        w.writerow(header)
+        if all_ys:
+            y_min, y_max = min(all_ys), max(all_ys)
+            for y in range(y_min, y_max + 1):
+                row = [y, y - y_min]
+                for r in results:
+                    for table in (lut, lut_cap):
+                        od = table[r["label"]].get(y)
+                        row.append(f"{od:.4f}" if od is not None and math.isfinite(od) else "")
+                w.writerow(row)
 
-    fig = draw_figure(run_dir, results, geo, front_y, mode)
+    def wl_entry(r):
+        p = r["profile"]
+        return {
+            "nm": r["wavelength_nm"], "label": r["label"],
+            "channel": r["channel"],
+            "intensity_pct": r["intensity_pct"],
+            "pedestal_mode": p.get("pedestal_mode"),
+            "pedestal_rule": p.get("pedestal_rule"),
+            "pedestal": _finite(p.get("pedestal")),
+            "pedestal_cap": _finite(p.get("pedestal_cap")),
+            "i0": _finite(p.get("i0")),
+            "extinct_y": p.get("extinct_y"),
+            "od_last": _finite(round(p["ods"][-1], 3)) if p["ods"] else None,
+            "rows": len(p["ys"]),
+            "photo": r["photo"].name,
+            "warning": r["warning"],
+            "analysis_warning": p.get("warning"),
+        }
 
     summary = {
         "captured_at": ts,
         "mode": mode,
-        "geometry_locked": locked_geo is not None,
-        "fixed_intensity": bool(fixed_intensity),
-        "white_intensity_pct": white_brt,
-        "white_intensity_fixed": white_intensity is not None,
-        # ref_white.jpg's headspace band (a measured probe of effective
-        # intensity). mean: R/G/B average, clip: saturated-pixel fraction,
-        # px: band height. px<5 suggests broken geometry detection, in which
-        # case mean/clip are null (see README.md).
-        "white_headspace_mean": headspace_mean,
-        "white_headspace_clip": headspace_clip,
-        "white_headspace_px": headspace_px,
+        **(extra or {}),
         "geometry": {"meniscus_y": geo["meniscus"]["y"],
                      "liquid_bottom_y": geo["liquid"]["bottom_y"],
                      "body_x0": geo["body"]["x0"], "body_x1": geo["body"]["x1"],
-                     "fill_fraction": geo["liquid"]["fill_fraction_of_body"]},
+                     "fill_fraction": geo["liquid"].get("fill_fraction_of_body")},
+        # the commanded value; the read-back is camera_settings["wb_temp"]
         "white_balance_fixed": WB_FIXED,
+        **camera_record(camera_before, camera_after),
         "sediment_front_y": front_y,
-        "wavelengths": [{
-            "nm": r["wavelength_nm"], "label": r["label"],
-            "channel": r["channel"],
-            "intensity_pct": r["intensity_pct"],
-            "pedestal_mode": r["profile"]["pedestal_mode"],
-            "extinct_y": r["profile"]["extinct_y"],
-            "od_last": round(r["profile"]["ods"][-1], 3) if r["profile"]["ods"] else None,
-            "photo": r["photo"].name,
-            "warning": r["warning"],
-        } for r in results],
+        "wavelengths": [wl_entry(r) for r in results],
     }
     if named:
         summary["folder"] = run_dir.parent.name
@@ -884,21 +1147,30 @@ def _run_locked(start_intensity: int, restore: tuple[int, int],
     # encoding is explicit: Windows defaults to cp932, which would mangle
     # non-ASCII warning text and be incompatible with reading it back on macOS.
     (run_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8")
 
+    fig = draw_figure(run_dir, results, geo, front_y, mode)
+    _print_report(run_dir, results, mode, front_y, fig)
+    return 0
+
+
+def _print_report(run_dir, results, mode, front_y, fig) -> None:
     print(f"\nOutput: {run_dir}")
     for r in results:
         p = r["profile"]
         ext = f", extinct at y={p['extinct_y']}" if p["extinct_y"] else ""
         warn = f" [warning] {r['warning']}" if r["warning"] else ""
+        if p.get("warning"):
+            warn += f" [analysis] {p['warning']}"
         head = (f"white (ch {r['channel']}" if mode == "white"
                 else f"{r['label']}nm (ch {r['channel']}")
+        max_od = f"{max(p['ods']):.2f}" if p["ods"] else "n/a"
         print(f"  {head}, intensity {r['intensity_pct']}%): "
-              f"max OD {max(p['ods']):.2f}{ext}{warn}")
+              f"max OD {max_od}{ext}{warn}")
     if front_y is not None:
         print(f"  Sediment front: y~={front_y}")
     print(f"  Figure: {fig}")
-    return 0
 
 
 def main() -> int:

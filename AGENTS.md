@@ -38,13 +38,13 @@ configuration and flow files, not in the driver code.
 | `examples/zif8/` | Example flows of the paper's ZIF-8 demonstration. |
 | `examples/microscope/` | Example flow using the USB digital microscope (`capture_microscope`). |
 | `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument. |
-| `tests/`, `src/monitoring/tests/` | Unit tests; none need hardware. |
+| `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 
 ## How to verify a change (no hardware needed)
 
 ```bash
 pip install -r requirements.txt            # or the lighter set in .github/workflows/ci.yml
-python -m pytest tests/ src/monitoring/tests/ -q
+python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q
 python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --validate-only
 python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --mock
 python -m src.flow.csv_runner.run_csv --mock

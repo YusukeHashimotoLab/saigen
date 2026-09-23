@@ -549,11 +549,19 @@ function updateScaleLabels(s) {
 }
 
 async function post(name, value) {
-  await fetch("/api/control", {
+  const res = await fetch("/api/control", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({name, value})
   });
+  if (!res.ok) {
+    // e.g. 409 while a measurement holds the controls: show it and
+    // re-read the camera so the sliders do not show an unapplied value
+    let msg = "Camera control failed";
+    try { msg = (await res.json()).error || msg; } catch (e) {}
+    toast(msg);
+    refresh();
+  }
 }
 
 async function refresh() {

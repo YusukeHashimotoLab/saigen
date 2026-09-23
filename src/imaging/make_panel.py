@@ -17,11 +17,19 @@ in profiles.csv, so it is computed by importing `acquire.od_profile()`
 capture a photo unless explicitly called).
 
 The white G curve is not drawn in (e) by default: the dip just below the
-meniscus contaminates I0 for a few rows, and the entire supernatant is
-sRGB-saturated there, so it cannot be treated as a real measurement
-(`--with-white` draws it anyway, with the usual dashed-line convention for
-saturated regions). The saturated-fraction table is always printed to
-stdout regardless of this flag.
+meniscus contaminates I0 for a few rows, and in the example run the
+supernatant is sRGB-saturated there, so it cannot be treated as a real
+measurement. `--with-white` draws it anyway, as a plain solid line like the
+other curves (clipped rows are not marked in the plot; the clip fractions
+are reported in the stdout table and in the caption instead). The clip
+table is always printed to stdout regardless of this flag.
+
+Clipping is measured per pixel: for every image row, the fraction of the
+inner-60% body pixels whose secondary-channel sRGB value is >= SAT_THR.
+The draft caption is built from summary.json (illumination intensities,
+the camera settings read back at capture time, the camera device) and from
+these clip fractions; anything summary.json does not record is written as
+"unknown" rather than filled in with the reference values.
 
 `geometry.py` / `acquire.py` are only imported, never modified.
 This script never writes into the run directory or any data directory; all
@@ -84,6 +92,156 @@ CHAN_IDX = {"R": 0, "G": 1, "B": 2}
 
 # ---------------------------------------------------------------- helpers
 
+def row_clip_fractions(path: Path, channel_idx: int, x0: int, x1: int,
+                       thr: float = SAT_THR) -> np.ndarray:
+    """Per-row fraction of clipped pixels (sRGB >= thr) in one channel.
+
+    Uses the same column-trim rule as od_profile (inner 60% of the body's
+    columns). One value per image row, in 0..1.
+    """
+    trim = (x1 - x0) * 20 // 100
+    xi0, xi1 = x0 + trim, x1 - trim
+    img = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
+    return (img[:, xi0:xi1, channel_idx] >= thr).mean(axis=1)
+
+
+def clip_summary(fracs: np.ndarray, y0: int, y1: int) -> dict:
+    """Summarise per-row clip fractions over rows y0..y1 (inclusive).
+
+    pixel_frac: fraction of all pixels in those rows that are clipped;
+    rows_any: fraction of rows with at least one clipped pixel;
+    rows_majority: fraction of rows with more than half their pixels clipped.
+    """
+    rows = np.asarray(fracs[y0:y1 + 1], dtype=np.float64)
+    if rows.size == 0:
+        return {"pixel_frac": None, "rows_any": None, "rows_majority": None,
+                "n_rows": 0}
+    return {"pixel_frac": float(rows.mean()),
+            "rows_any": float((rows > 0).mean()),
+            "rows_majority": float((rows > 0.5).mean()),
+            "n_rows": int(rows.size)}
+
+
+def _fmt(v, unit: str = "") -> str:
+    return "unknown" if v is None else f"{v}{unit}"
+
+
+def _join(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _pct(v) -> str:
+    return "unknown" if v is None else f"{v:.1%}"
+
+
+def build_caption(summary: dict, run_name: str, run_dir, clip: dict,
+                  with_white: bool) -> str:
+    """Draft figure caption built only from summary.json and measured clip
+    fractions (clip: label -> clip_summary(); labels white/625/525/465).
+
+    Values summary.json does not record are written as "unknown".
+    """
+    wl = {str(w.get("label")): w for w in summary.get("wavelengths", [])}
+    cam = summary.get("camera_settings") or {}
+    dev = (summary.get("camera_device") or {}).get("name")
+
+    def inten(label):
+        return _fmt((wl.get(label) or {}).get("intensity_pct"), "%")
+
+    def chan(label):
+        return (wl.get(label) or {}).get("channel") or "unknown"
+
+    white_int = _fmt(summary.get("white_intensity_pct"), "%")
+    illum = (f"white (CCT, intensity {white_int}), 625 nm (HSI, {inten('625')}), "
+             f"525 nm (HSI, {inten('525')}) and 465 nm (HSI, {inten('465')})")
+
+    if cam.get("wb_temp") is not None and cam.get("auto_wb") is False:
+        wb = f"white balance read back as manual {cam['wb_temp']} K"
+    elif cam.get("wb_temp") is not None:
+        wb = (f"white balance {cam['wb_temp']} K with auto white balance "
+              f"{_fmt(cam.get('auto_wb'))}")
+    elif summary.get("white_balance_fixed") is not None:
+        wb = (f"white balance commanded to manual "
+              f"{summary['white_balance_fixed']} K (read-back not recorded)")
+    else:
+        wb = "white balance unknown"
+    cam_desc = (f"{dev or 'camera model unknown (not recorded in summary.json)'}; "
+                f"exposure {_fmt(cam.get('exposure'))}, gain {_fmt(cam.get('gain'))}, "
+                f"focus {_fmt(cam.get('focus'))}, auto exposure "
+                f"{_fmt(cam.get('auto_exposure'))}, {wb}")
+    if not cam:
+        cam_desc += (" (camera settings were not recorded for this run, so "
+                     "the conditions above are unknown)")
+
+    clipped, unclipped, unknown = [], [], []
+    for label in ("625", "525", "465"):
+        c = clip.get(label) or {}
+        if c.get("pixel_frac") is None:
+            unknown.append(f"{label} nm")
+        elif c["pixel_frac"] == 0:
+            unclipped.append(f"{label} nm")
+        else:
+            clipped.append(
+                f"{label} nm ({_pct(c['pixel_frac'])} of liquid-region pixels; "
+                f"{_pct(c['rows_majority'])} of rows more than half clipped)")
+    parts = []
+    if clipped:
+        parts.append("In this run the secondary channel is sensor-clipped for "
+                     + _join(clipped) + "; over clipped rows the plotted "
+                     "value is limited by the sensor, not a true "
+                     "transmittance measurement.")
+    if unclipped:
+        parts.append(_join(unclipped) + " "
+                     + ("has" if len(unclipped) == 1 else "have")
+                     + " no clipped pixel in the liquid region.")
+    if unknown:
+        parts.append("Clipping unknown for " + _join(unknown) + ".")
+    clip_clause = " ".join(parts)
+
+    cw = clip.get("white") or {}
+    wfrac = _pct(cw.get("pixel_frac"))
+    if with_white:
+        white_clause = (f"the white curve uses the camera's G channel "
+                        f"({wfrac} of its liquid-region pixels clipped). ")
+    else:
+        white_clause = (f"the white photograph (a) is shown for visual "
+                        f"reference only ({wfrac} of its G-channel "
+                        f"liquid-region pixels clipped); no white "
+                        f"transmittance curve is plotted. ")
+
+    warns = [f"{label} nm: {w['warning']}" for label, w in wl.items()
+             if w.get("warning")]
+    warn_clause = ("Capture warnings recorded in summary.json: "
+                   + "; ".join(warns) + ". ") if warns else ""
+
+    g = summary.get("geometry") or {}
+    return f"""# Figure caption (draft) — {run_name}
+
+**Depth-resolved transmittance panel.** Backlit photographs of the sample
+vial ({run_name}, captured {summary.get('captured_at') or 'unknown'}) under
+{illum} illumination (wavelengths nominal, unmeasured, ±10-15 nm), imaged
+with {cam_desc}. Left to right: (a-d) sample region (cap bottom to vial
+bottom) cropped to a common rectangle across all four exposures, shown
+without panel labels; (e) optical density / transmittance versus image row,
+sharing the same vertical scale (pixel row) as (a-d) so that visual features
+line up horizontally with the photographs. In (e), the red/green/blue curves
+correspond to the 625/525/465 nm (nominal) illumination channels
+respectively, plotted as solid lines throughout their full depth range. Each
+monochromatic channel is measured on its non-dominant ("secondary")
+camera channel (625->{chan('625')}, 525->{chan('525')}, 465->{chan('465')});
+{white_clause}Values are sRGB-linearized, pedestal-subtracted, with I0 taken
+just below the meniscus. {clip_clause} {warn_clause}Clip fractions: secondary
+channel sRGB >= {SAT_THR:.0f}, inner 60% of body columns, liquid rows
+meniscus_y..liquid_bottom_y.
+
+Geometry: meniscus_y={g.get('meniscus_y')}, liquid_bottom_y={g.get('liquid_bottom_y')},
+body_x0/x1={g.get('body_x0')}/{g.get('body_x1')}, sediment_front_y={summary.get('sediment_front_y')}
+(from {run_dir}/summary.json).
+"""
+
+
 def srgb_row_means(path: Path, channel_idx: int, x0: int, x1: int) -> np.ndarray:
     """Per-row mean sRGB value (still non-linear). Uses the same column-trim
     rule as od_profile (inner 60% of the body's columns)."""
@@ -108,8 +266,8 @@ def load_csv_channel(csv_path: Path, col: str) -> tuple[list[int], list[float]]:
 def plot_curve(ax, ys: list[int], vals: list[float], color: str,
               label: str) -> None:
     """Draw a curve as a solid line over its full range. Sensor-clipped
-    regions are not dashed either (drawing is unaffected by the saturation
-    check; that check only feeds the stdout table)."""
+    regions are not dashed or otherwise marked (drawing is unaffected by
+    the clip check; that check feeds the stdout table and the caption)."""
     if not ys:
         return
     ax.plot(vals, ys, color=color, linestyle="solid", linewidth=1.3, label=label)
@@ -146,7 +304,7 @@ def make_depth_ticks(y_top: int, y_bot: int, men_y: int,
 
 # ---------------------------------------------------------------- main
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run_dir", type=Path, help="e.g. photos/expA/vial1")
     ap.add_argument("--y", dest="xquantity", choices=["transmittance", "od"],
@@ -159,7 +317,7 @@ def main() -> None:
                     help="If given, show (e)'s y-axis ticks in mm (5mm steps) instead of px")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR,
                     help=f"Output directory (default: {DEFAULT_OUT_DIR})")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # resolved relative to the current directory first, then to the module
     # directory, so `examples/zif8_vial_5s` works from src/imaging and from
@@ -218,30 +376,33 @@ def main() -> None:
     geo_white["body"]["x1"] = body_x1
     prof_white = od_profile(ref_white, sec_ch=CHAN_IDX["G"], geo=geo_white)
 
-    # ---- saturated rows per channel (sRGB >= 250, same column trim as od_profile) ----
-    sat_rows = {}          # label -> bool array (all rows)
+    # ---- per-pixel clipping per row (sRGB >= SAT_THR, same column trim as od_profile) ----
     row_means = {}         # label -> float array (all rows, for the stdout table)
+    clip = {}              # label -> clip_summary() over the liquid rows
     sat_specs = [("white", ref_white, CHAN_IDX["G"])] + [
         (label, photo, ch) for label, photo, ch, _ in color_specs]
     for label, photo, ch in sat_specs:
-        rm = srgb_row_means(photo, ch, body_x0, body_x1)
-        row_means[label] = rm
-        sat_rows[label] = rm >= SAT_THR
+        row_means[label] = srgb_row_means(photo, ch, body_x0, body_x1)
+        clip[label] = clip_summary(
+            row_clip_fractions(photo, ch, body_x0, body_x1), men_y, bot_y)
 
-    # ---- stdout: saturated-row-fraction table (liquid rows = meniscus_y..liquid_bottom_y) ----
-    # the white fraction is always printed regardless of --with-white.
-    print("\nSaturated row fraction (liquid rows y=%d..%d, sRGB >= %.0f, inner 60%% of body columns):" %
+    # ---- stdout: clip table (liquid rows = meniscus_y..liquid_bottom_y) ----
+    # the white row is always printed regardless of --with-white.
+    print("\nClipped pixels (liquid rows y=%d..%d, sRGB >= %.0f, inner 60%% of body columns):" %
           (men_y, bot_y, SAT_THR))
-    print(f"{'channel':<14}{'photo':<16}{'sat_frac':>10}{'min':>8}{'max':>8}")
-    label_to_ch_name = {"white": "white (G)", "625": "625 (G)",
-                        "525": "525 (B)", "465": "465 (G)"}
+    print(f"{'channel':<14}{'photo':<16}{'pix_frac':>10}{'rows>0':>8}{'rows>50%':>10}"
+          f"{'mean min':>10}{'mean max':>10}")
+    label_to_ch_name = {"white": "white (G)"}
+    label_to_ch_name.update({label: f"{label} ({wl_info[label]['channel']})"
+                             for label, _, _, _ in color_specs})
     label_to_photo = {"white": "ref_white.jpg"}
     label_to_photo.update({label: p.name for label, p, _, _ in color_specs})
     for label in ("white", "625", "525", "465"):
         liquid = row_means[label][men_y:bot_y + 1]
-        frac = float((liquid >= SAT_THR).mean())
+        c = clip[label]
         print(f"{label_to_ch_name[label]:<14}{label_to_photo[label]:<16}"
-              f"{frac:>10.1%}{liquid.min():>8.1f}{liquid.max():>8.1f}")
+              f"{c['pixel_frac']:>10.1%}{c['rows_any']:>8.1%}{c['rows_majority']:>10.1%}"
+              f"{liquid.min():>10.1f}{liquid.max():>10.1f}")
     if not args.with_white:
         print("(white G is not plotted in (e) because it is a contaminated measurement; "
               "use --with-white to draw it anyway)")
@@ -381,59 +542,8 @@ def main() -> None:
     print(f"\nWrote: {out_png} ({out_png.stat().st_size} bytes)")
     print(f"Wrote: {out_pdf} ({out_pdf.stat().st_size} bytes)")
 
-    # ---- draft caption ----
-    sat_white = row_means["white"][men_y:bot_y + 1]
-    sat_465 = row_means["465"][men_y:bot_y + 1]
-    frac_white = float((sat_white >= SAT_THR).mean())
-    frac_465 = float((sat_465 >= SAT_THR).mean())
-
-    if args.with_white:
-        white_clause = (
-            "the white curve uses the camera's G channel; its supernatant "
-            f"region is sensor-clipped ({frac_white:.0%} of liquid rows). ")
-        clip_clause = (
-            f"In this run the clear supernatant also saturates the 465 nm "
-            f"(blue) secondary channel ({frac_465:.0%} of liquid rows); over "
-            f"that region the plotted T≈1 is an artifact of the clipped "
-            f"sensor reading, not a true transmittance measurement, while "
-            f"625 nm and 525 nm remain unclipped throughout.")
-    else:
-        white_clause = (
-            "the white photograph (a) is shown for visual reference only; its "
-            "supernatant region is sensor-clipped "
-            f"({frac_white:.0%} of liquid rows) so no white transmittance curve "
-            "is plotted. ")
-        clip_clause = (
-            f"In this run the clear supernatant also saturates the 465 nm "
-            f"(blue) secondary channel ({frac_465:.0%} of liquid rows); over "
-            f"that region the plotted T≈1 is an artifact of the clipped "
-            f"sensor reading, not a true transmittance measurement, while "
-            f"625 nm and 525 nm remain unclipped throughout.")
-
-    caption = f"""# Figure caption (draft) — {run_name}
-
-**Depth-resolved transmittance panel.** Backlit photographs of the sample
-vial ({run_name}, captured {summary.get('captured_at', '')}) under white,
-625 nm, 525 nm, and 465 nm (nominal, unmeasured, ±10-15 nm) NEEWER RGB62
-illumination (HSI mode, 1% intensity), imaged with a Logitech C920 at
-exposure 20 / gain 0 / white balance fixed at 4600 K (all manual, never
-returned to auto). Left to right: (a-d) sample region (cap bottom to vial
-bottom) cropped to a common rectangle across all four exposures, shown
-without panel labels; (e) optical density / transmittance versus image row,
-sharing the same vertical scale (pixel row) as (a-d) so that visual features
-line up horizontally with the photographs. In (e), the red/green/blue curves
-correspond to the 625/525/465 nm (nominal) illumination channels
-respectively, plotted as solid lines throughout their full depth range. Each
-monochromatic channel is measured on its non-dominant ("secondary")
-camera channel (625->G, 525->B, 465->G) because the dominant channel
-saturates even at 1% LED intensity; {white_clause}Values are sRGB-linearized,
-pedestal-subtracted (lens-flare / stray-light floor removed), with I0 taken
-just below the meniscus. {clip_clause}
-
-Geometry: meniscus_y={men_y}, liquid_bottom_y={bot_y},
-body_x0/x1={body_x0}/{body_x1}, sediment_front_y={front_y}
-(from {run_dir}/summary.json).
-"""
+    # ---- draft caption (from summary.json + the measured clip fractions) ----
+    caption = build_caption(summary, run_name, run_dir, clip, args.with_white)
     out_caption = out_dir / f"{run_name}_caption.md"
     out_caption.write_text(caption, encoding="utf-8")
     print(f"Wrote: {out_caption} ({out_caption.stat().st_size} bytes)")

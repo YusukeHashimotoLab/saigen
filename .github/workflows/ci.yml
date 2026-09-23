@@ -63,7 +63,7 @@ jobs:
             | xargs -0 python -m py_compile
 
       - name: Run unit tests
-        run: python -m pytest tests/ src/monitoring/tests/ -q
+        run: python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q
 
       - name: Validate example flows against the schema
         run: |

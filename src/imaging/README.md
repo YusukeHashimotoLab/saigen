@@ -46,7 +46,9 @@ photographs are comparable:
   4600 K manual. It stores this once per platform (macOS `uvc-util` control
   names under `"reference"`, Windows logical names under `"win32"`), applied
   through `hw.py`'s logical control names; `camera_server.py`'s `/api/health`
-  and the acquisition scripts check the live camera against it.
+  and the acquisition scripts check the live camera against it. Every run
+  records the settings **read back from the camera** at capture time
+  (`camera_settings` in `summary.json`), not these reference constants.
 - **Light** — [`config/light_reference.json`](config/light_reference.json)
   documents the illumination conditions used by `acquire.py`: a white CCT
   shot at 5600 K (used only for detecting the vial geometry; its brightness
@@ -121,15 +123,28 @@ Platform-specific notes for this module:
   `config/camera_local.example.json` to `config/camera_local.json`
   (git-ignored) and set `win32_device_name`/`win32_device_path` to pick the
   C920 unambiguously — `hw.py` refuses to start on zero or multiple matches.
+- **macOS camera selection** — ffmpeg opens the camera by name
+  (`HD Pro Webcam C920`) and `hw.py` looks up the `uvc-util` index of that
+  same name (`uvc-util -d`), so controls always go to the streamed camera;
+  it refuses to start if the name is missing or matches more than one
+  device.
 - **The light** must be powered on before starting `camera_server.py`. On
   macOS, `neewer_light.py` piggybacks onto an existing BLE connection rather
   than opening its own, so it can share a connection already held by the
-  NEEWER Control Center app instead of competing with it.
+  NEEWER Control Center app instead of competing with it. If more than one
+  NEEWER light is reachable, `neewer_light.py` refuses to guess: set
+  `NEEWER_DEVICE_ID` in the repository's `.env` (or the environment) to part
+  of the device id shown in the error message (macOS: peripheral UUID;
+  Windows: WinRT device id or Bluetooth address). Every BLE write is
+  checked; a device error or a missing acknowledgement aborts the command.
 - **`IMAGING_DATA_DIR`** (environment variable) sets where captured photos
   and analysis output go. Default: `imaging_data/` at the repository root
   (`photos/` and `analysis/` subdirectories; see `paths.py`). The location is
   anchored to the module file, not to the current directory, so the camera
-  server and a hand-run `acquire.py` always write to the same place.
+  server and a hand-run `acquire.py` always write to the same place. A
+  relative value is resolved against the directory the server was started
+  from, and the server passes the resolved path (and its actual `--port`,
+  as `IMAGING_SERVER_URL`) to the `acquire.py` child it launches.
 
 ## Usage
 
@@ -145,7 +160,9 @@ Open `http://localhost:8799`. The page has five tabs:
   auto-exposure/auto-focus/auto-white-balance toggles, and a manual
   **Capture** button; a warning banner reminds you to keep white balance
   manual at 4600 K, and flags that exposure changes need a server restart to
-  reach the live preview.
+  reach the live preview. While a measurement holds the lock, control writes
+  from this tab (or any other client) are refused with HTTP 409; only the
+  running acquisition, which registers an owner token, may write.
 - **Light** — On/Off, and either White (CCT: brightness + colour temperature)
   or Monochrome (HSI: hue + saturation + brightness, with quick Red 625 /
   Green 525 / Blue 465 buttons) control.
@@ -157,6 +174,12 @@ Open `http://localhost:8799`. The page has five tabs:
 - **Analysis** — a Refresh button and the most recent run's `spectral.png`.
 - **Conditions** — one-shot frame (geometry) calibration, and named presets
   that save/apply/verify a full camera+light+geometry configuration.
+  Applying a preset checks every camera write and reads the settings back;
+  a failed write or a differing read-back is reported and the light and
+  geometry are left untouched. If the stream is stale afterwards (macOS),
+  the response says the server must be restarted before measuring: per
+  rule 2 above, neither the live view nor captured photos see the change
+  until then.
 
 ### 2. Apply and verify the reference camera settings
 
@@ -180,7 +203,13 @@ python acquire.py --folder <experiment> --name <sample>
 
 This drives the light through white → red → green → blue, capturing one
 photo per step through the running `camera_server.py`, and writes the run to
-`<IMAGING_DATA_DIR>/photos/<experiment>/<sample>/`. Useful options (see
+`<IMAGING_DATA_DIR>/photos/<experiment>/<sample>/`. Before the first photo it
+fixes and reads back the white balance, then queries `/api/health` and
+**aborts if the stream is stale** (settings changed after the stream
+started, e.g. white balance switched from auto on this run — restart the
+server and run again), if there is no fresh frame, or if the controls
+cannot be read. A mismatch against `camera_reference.json` is only a
+warning (the reference exposure depends on the sample) but is recorded. Useful options (see
 `python acquire.py --help` for the full list):
 
 | Option | Effect |
@@ -200,9 +229,9 @@ Each run directory contains:
 |---|---|
 | `ref_white.jpg` | White-light reference photo (geometry detection; also the photometry image itself in white-only mode) |
 | `shot_red.jpg`, `shot_green.jpg`, `shot_blue.jpg` | Monochromatic captures (full mode only) |
-| `profiles.csv` | Per-row optical density, one column per wavelength/channel (`od_625`/`od_525`/`od_465` in full mode, `od_R`/`od_G`/`od_B` in white-only mode) |
+| `profiles.csv` | Per-row optical density, one column per wavelength/channel (`od_625`/`od_525`/`od_465` in full mode, `od_R`/`od_G`/`od_B` in white-only mode), each followed by `od_<label>_cap`, the uncorrected profile computed with the cap pedestal alone (identical when `pedestal_mode` is `cap`) |
 | `spectral.png` | OD-vs-depth figure generated by `acquire.py` at capture time |
-| `summary.json` | Geometry (`meniscus_y`, `liquid_bottom_y`, `body_x0`/`x1`, `fill_fraction`), per-wavelength intensity/channel/warning, `sediment_front_y`, `white_balance_fixed`, and measured headspace brightness used to cross-check actual light intensity |
+| `summary.json` | Geometry (`meniscus_y`, `liquid_bottom_y`, `body_x0`/`x1`, `fill_fraction`), per-wavelength intensity/channel/warning plus `pedestal_rule`, `i0` and `analysis_warning`, `sediment_front_y`, `white_balance_fixed` (commanded), `camera_settings` (read back before the first photo), `camera_settings_after` / `camera_settings_changed` (read back after the last), `camera_device`, `camera_matches_reference`/`camera_mismatches`, and measured headspace brightness used to cross-check actual light intensity. Written before the figure, so a plotting failure never loses it; never contains NaN/inf |
 
 ### 5. Make the publication panel
 
@@ -227,8 +256,16 @@ photographs, so visual features in the photos line up with inflections in the
 curve. The white photograph is not plotted as a curve by default: its green
 channel is saturated over a clear supernatant (the sensor clips before the
 signal can be used quantitatively), so it is shown only as a visual
-reference; `--with-white` draws it anyway. The saturated-row-fraction table
-for all four channels is always printed to stdout regardless of that flag.
+reference; `--with-white` draws it anyway (as a plain solid line). A
+clip table for all four channels — per row, the fraction of pixels at
+sRGB >= 250 in the inner 60 % of the body columns, summarised over the
+liquid rows — is always printed to stdout regardless of that flag.
+
+The draft caption is built from the run's `summary.json` (LED intensities,
+the camera settings and device read back at capture time) and from those
+measured clip fractions. Anything the run did not record is written as
+"unknown" — e.g. the included example predates the camera read-back, so its
+caption says the exposure is unknown rather than quoting the reference.
 
 ## Correspondence with paper Figure 6
 
@@ -272,7 +309,13 @@ depth-resolved optical density `OD(y) = -log10(I(y)/I0)`:
   region above the cap; if attenuation is deep enough that the signal pins to
   stray light instead of continuing to fall, a flat low-value window further
   down is used as the floor instead and the curve is truncated there (a
-  lower bound on OD only).
+  lower bound on OD only). Which rule chose the pedestal is recorded
+  (`pedestal_rule`: `cap`, `flat_window` or `min_then_rise`); the
+  minimum-then-rise rule is a heuristic, so it adds an `analysis_warning`,
+  and the uncorrected cap-pedestal profile is saved next to the corrected
+  one for comparison.
+- A uniformly dark image, or a geometry that does not fit the image, gives
+  an empty profile with a warning instead of aborting the run.
 - The sedimentation front is the shallowest depth where the 625 nm OD rises
   above a fixed threshold for a sustained run of rows.
 

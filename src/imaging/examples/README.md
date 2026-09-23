@@ -45,7 +45,9 @@ a validated measurement. Specifically:
   in the metering channel of `ref_white.jpg` (the whole clear supernatant
   region). `make_panel.py` therefore draws no white transmittance curve by
   default and shows the white photograph for visual reference only;
-  `--with-white` plots it anyway, dashed over the saturated rows. Every run
+  `--with-white` plots it anyway, as a plain solid line (clipped rows are
+  not marked in the plot; their fractions are in the stdout table and the
+  draft caption). Every run
   in this measurement batch has a white reference clipped between 62 % and
   90 % over the vial-neck region, which is why this batch should be re-measured
   with a lower white intensity.
