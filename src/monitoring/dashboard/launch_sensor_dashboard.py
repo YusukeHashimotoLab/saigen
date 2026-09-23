@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Depends, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Depends, Header, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
@@ -258,38 +258,75 @@ REPO_ROOT = os.path.dirname(os.path.dirname(MONITORING_DIR))   # repository root
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 
-def _load_dashboard_ports():
+class DashboardConfigError(RuntimeError):
+    """An existing monitoring config file cannot be used.
+
+    Local equivalent of ``src.config.ConfigError`` (not imported, so the
+    dashboard keeps running as a standalone script without the repository's
+    package on sys.path). Raised instead of falling back to defaults, so a
+    typo in config.yaml cannot silently move the dashboard to other ports than
+    the Pis are configured for.
+    """
+
+
+def _load_dashboard_ports(candidates=None):
     """Load the sensor_dashboard port settings.
 
     Single source of truth is src/monitoring/config.yaml. If that file does not
     exist (not yet created by the user), fall back to config.example.yaml, and
-    finally to the built-in defaults below. This loader is PC-side only — the
-    Pi agent (pi_sensor_agent.py) intentionally does not depend on PyYAML and
-    reads its own settings from environment variables instead.
+    finally to the built-in defaults below. The first file that *exists* is
+    used; if it cannot be read or parsed, or its values are not port numbers,
+    DashboardConfigError is raised — there is no silent fallback. This loader
+    is PC-side only — the Pi agent (pi_sensor_agent.py) intentionally does not
+    depend on PyYAML and reads its own settings from environment variables.
     """
     defaults = {"web_port": 8000, "tcp_port": 50001}
-    candidates = [
-        os.path.join(MONITORING_DIR, "config.yaml"),
-        os.path.join(MONITORING_DIR, "config.example.yaml"),
-    ]
-    try:
-        import yaml
-    except ImportError:
-        logger.warning("PyYAML is not installed; using built-in default ports %s", defaults)
-        return defaults
+    if candidates is None:
+        candidates = [
+            os.path.join(MONITORING_DIR, "config.yaml"),
+            os.path.join(MONITORING_DIR, "config.example.yaml"),
+        ]
 
     for path in candidates:
         if not os.path.exists(path):
             continue
         try:
+            import yaml
+        except ImportError as e:
+            raise DashboardConfigError(
+                f"PyYAML is not installed, so {path} cannot be read "
+                f"(run: pip install -r src/monitoring/requirements.txt). Refusing to fall back to "
+                f"built-in defaults."
+            ) from e
+        try:
             with open(path, encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
-            section = loaded.get("sensor_dashboard", {}) if isinstance(loaded, dict) else {}
-            merged = dict(defaults)
-            merged.update({k: int(v) for k, v in section.items() if k in defaults})
-            return merged
-        except Exception as e:
-            logger.error("Failed to read %s, trying next fallback: %s", path, e)
+                loaded = yaml.safe_load(f)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+            raise DashboardConfigError(f"Could not read {path}: {e}") from e
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise DashboardConfigError(
+                f"{path}: the top level must be a mapping, got {type(loaded).__name__}"
+            )
+        section = loaded.get("sensor_dashboard")
+        if section is None:
+            section = {}
+        if not isinstance(section, dict):
+            raise DashboardConfigError(
+                f"{path}: 'sensor_dashboard' must be a mapping, got {type(section).__name__}"
+            )
+        merged = dict(defaults)
+        for key in defaults:
+            if key not in section:
+                continue
+            value = section[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value <= 65535):
+                raise DashboardConfigError(
+                    f"{path}: sensor_dashboard.{key} must be a port number (1-65535), got {value!r}"
+                )
+            merged[key] = value
+        return merged
     logger.warning(
         "Neither config.yaml nor config.example.yaml found under %s; using built-in defaults %s",
         MONITORING_DIR, defaults,
@@ -320,6 +357,35 @@ for h in os.environ.get("SENSOR_DASHBOARD_ALLOWED_HOSTS", "").split(","):
     if h.strip():
         _allowed.add(h.strip())
 ALLOWED_HOSTS = sorted(_allowed)
+
+
+def _parse_ip_allowlist(raw: str):
+    """Parse a comma-separated list of IPs / CIDR networks; raise on a bad entry."""
+    nets = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as e:
+            raise DashboardConfigError(
+                f"SENSOR_DASHBOARD_PI_ALLOWED_IPS: {entry!r} is not an IP address or network: {e}"
+            ) from e
+    return nets
+
+
+# Sensor-ingestion protection (TCP :50001). Both are optional and independent:
+# - SENSOR_DASHBOARD_PI_ALLOWED_IPS: comma-separated IPs/CIDRs (e.g.
+#   "192.0.2.21,192.0.2.0/28"); connections from any other address are closed
+#   before a byte is read. Empty = accept any address (the historical default).
+# - SENSOR_DASHBOARD_PI_TOKEN: shared secret; when set, the first line of every
+#   connection must be {"type": "auth", "token": "<secret>"} (the Pi agent
+#   sends it when SENSOR_AGENT_TOKEN is set), otherwise the connection is closed.
+PI_ALLOWED_NETS = _parse_ip_allowlist(os.environ.get("SENSOR_DASHBOARD_PI_ALLOWED_IPS", ""))
+PI_TOKEN = os.environ.get("SENSOR_DASHBOARD_PI_TOKEN") or None
+# How long a connection may take to send its auth line.
+PI_AUTH_TIMEOUT_S = 5.0
 # TCP-ingestion DoS protection (prevents an unbounded buffer if no newline ever arrives).
 TCP_MAX_LINE = 64 * 1024        # limit for a single line (one JSON message)
 TCP_MAX_BUFFER = 256 * 1024     # limit for the whole unprocessed buffer
@@ -383,6 +449,57 @@ async def require_token(x_auth_token: str | None = Header(default=None)):
     """Require a matching token only when AUTH_TOKEN is set (pass through otherwise)."""
     if not _token_ok(x_auth_token):
         raise HTTPException(status_code=401, detail="invalid or missing auth token")
+
+
+def _same_origin(source: str | None, host_header: str | None) -> bool:
+    """Whether an Origin/Referer URL points at this very dashboard.
+
+    Same-origin means the URL's ``host[:port]`` equals the request's Host
+    header (which TrustedHostMiddleware has already checked against
+    ALLOWED_HOSTS) and the scheme is http(s). ``Origin: null`` (sandboxed
+    frames, file://) is never same-origin.
+    """
+    if not source or source == "null" or not host_header:
+        return False
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    return parsed.netloc.lower() == host_header.lower()
+
+
+async def require_same_origin(request: Request):
+    """Reject cross-site browser requests to state-changing endpoints.
+
+    A browser attaches ``Origin`` to every cross-site POST (and ``Referer``
+    in most other cases), so a page on another site cannot make the operator's
+    browser start/stop a recording, upload files or reset tag zeros: an HTML
+    form or ``fetch(..., {mode: "no-cors"})`` needs no token when
+    SENSOR_DASHBOARD_TOKEN is unset and no request body for /api/end. The
+    check uses Origin if present, else Referer. A request with neither is a
+    non-browser client (the flow runner, the GUI, curl) and is let through;
+    it is still subject to the token when one is configured.
+    """
+    host = request.headers.get("host")
+    origin = request.headers.get("origin")
+    if origin is not None:
+        ok = _same_origin(origin, host)
+        source = origin
+    else:
+        referer = request.headers.get("referer")
+        if referer is None:
+            return
+        ok = _same_origin(referer, host)
+        source = referer
+    if not ok:
+        logger.warning("Rejected cross-origin %s %s from %r", request.method, request.url.path, source)
+        raise HTTPException(status_code=403, detail="cross-origin request refused")
+
+
+# Dependencies for every endpoint that changes dashboard state or writes files.
+STATE_CHANGING = [Depends(require_same_origin), Depends(require_token)]
 
 def _find_agent_path():
     candidates = [
@@ -467,16 +584,183 @@ def run_tcp_server():
         s.listen(10)
         while True:
             conn, addr = s.accept()
+            if not _pi_address_allowed(addr[0]):
+                logger.warning("Refused sensor connection from %s: not in SENSOR_DASHBOARD_PI_ALLOWED_IPS", addr[0])
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             threading.Thread(target=handle_pi_client, args=(conn, addr), daemon=True).start()
+
+
+def _pi_address_allowed(ip: str, nets=None) -> bool:
+    """Whether a sensor agent at ``ip`` may connect (always True with no allow-list)."""
+    nets = PI_ALLOWED_NETS if nets is None else nets
+    if not nets:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if getattr(addr, "ipv4_mapped", None) is not None:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in nets)
+
+
+class InvalidSensorMessage(ValueError):
+    """A sensor_data line that fails type checking; it is logged and dropped."""
+
+
+SENSOR_NUMBER_FIELDS = ("temp", "humi", "lux_raw", "uv", "voc")
+SENSOR_VECTOR_FIELDS = ("accel", "gyro")
+SENSOR_NAMES = ("bme280", "tsl25911", "icm20948", "ltr390", "sgp40")
+
+
+def _number_or_none(value, field):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidSensorMessage(f"{field} must be a number or null, got {type(value).__name__}")
+    if isinstance(value, float) and not (value == value and abs(value) != float("inf")):
+        raise InvalidSensorMessage(f"{field} must be finite")
+    return value
+
+
+def validate_sensor_message(msg) -> dict:
+    """Type-check one decoded sensor line and return a clean copy.
+
+    Only known fields are kept, so nothing a Pi (or anyone on the LAN) sends
+    beyond them reaches latest_sensor_data, the browser or the CSV. Every
+    reading may be ``null`` (the agent sends null for a failed read); the
+    vectors must be ``null`` or a list of exactly three numbers-or-null. The
+    legacy key ``lux`` of pre-2026-09-23 agents (which was the same raw
+    channel-0 count) is accepted as ``lux_raw``. Raises InvalidSensorMessage.
+    """
+    if not isinstance(msg, dict):
+        raise InvalidSensorMessage(f"message must be a JSON object, got {type(msg).__name__}")
+    if msg.get("type") != "sensor_data":
+        raise InvalidSensorMessage(f"unsupported message type {msg.get('type')!r}")
+    raw = dict(msg)
+    if "lux_raw" not in raw and "lux" in raw:
+        raw["lux_raw"] = raw["lux"]
+    clean = {"type": "sensor_data"}
+    for field in SENSOR_NUMBER_FIELDS:
+        clean[field] = _number_or_none(raw.get(field), field)
+    for field in SENSOR_VECTOR_FIELDS:
+        vec = raw.get(field)
+        if vec is None:
+            clean[field] = None
+            continue
+        if not isinstance(vec, (list, tuple)) or len(vec) != 3:
+            raise InvalidSensorMessage(f"{field} must be null or a list of 3 numbers")
+        clean[field] = [_number_or_none(v, f"{field}[{i}]") for i, v in enumerate(vec)]
+    ok = raw.get("ok")
+    if ok is None:
+        # Older agents send no flags: infer them from which values are present.
+        ok = {
+            "bme280": clean["temp"] is not None,
+            "tsl25911": clean["lux_raw"] is not None,
+            "icm20948": clean["accel"] is not None,
+            "ltr390": clean["uv"] is not None,
+            "sgp40": clean["voc"] is not None,
+        }
+    elif not isinstance(ok, dict) or not all(isinstance(v, bool) for v in ok.values()):
+        raise InvalidSensorMessage("ok must be a mapping of sensor name to true/false")
+    clean["ok"] = {name: bool(ok.get(name, False)) for name in SENSOR_NAMES}
+    model = raw.get("model")
+    clean["model"] = model[:64] if isinstance(model, str) else None
+    return clean
+
+
+def _read_auth_line(conn, ip: str) -> tuple[bool, str]:
+    """Read the first line of a connection and check it against PI_TOKEN.
+
+    Returns ``(ok, leftover)`` where leftover is whatever arrived after the
+    auth line (the first sensor lines, if the agent sent them in one packet).
+    """
+    buffer = ""
+    conn.settimeout(PI_AUTH_TIMEOUT_S)
+    try:
+        while "\n" not in buffer:
+            data = conn.recv(4096)
+            if not data:
+                return False, ""
+            buffer += data.decode(errors="ignore")
+            if len(buffer) > TCP_MAX_LINE:
+                return False, ""
+    except (socket.timeout, OSError):
+        return False, ""
+    finally:
+        try:
+            conn.settimeout(None)
+        except OSError:
+            pass
+    line, rest = buffer.split("\n", 1)
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        return False, ""
+    if not (isinstance(msg, dict) and msg.get("type") == "auth"
+            and isinstance(msg.get("token"), str)
+            and secrets.compare_digest(msg["token"], PI_TOKEN)):
+        return False, ""
+    return True, rest
+
+
+def _ingest_line(line: str, ip: str, hostname: str) -> str:
+    """Handle one received line. Returns the (possibly refreshed) hostname.
+
+    Any problem with the line is logged and the line dropped; nothing raised
+    here can end the connection or the recording thread.
+    """
+    if len(line) > TCP_MAX_LINE or not line.strip():
+        return hostname
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        logger.warning("Dropped non-JSON line from %s", ip)
+        return hostname
+    if isinstance(msg, dict) and msg.get("type") == "auth":
+        return hostname  # a repeated auth line (or one sent when no token is configured)
+    try:
+        clean = validate_sensor_message(msg)
+    except InvalidSensorMessage as e:
+        logger.warning("Dropped malformed sensor message from %s: %s", ip, e)
+        return hostname
+    if hostname == "Unknown Pi":
+        hostname = get_hostname_from_ip(ip)
+    clean["ip"] = ip
+    clean["hostname"] = hostname
+    # Arrival time of this sample; recording_loop writes it next to its own
+    # tick time, so a stale value (a Pi that stopped sending) is visible.
+    clean["received_at"] = datetime.now(timezone.utc).isoformat()
+    latest_sensor_data[ip] = clean
+    _broadcast_threadsafe(clean)
+    return hostname
+
 
 def handle_pi_client(conn, addr):
     ip = addr[0]
     hostname = get_hostname_from_ip(ip)
-    _broadcast_threadsafe({"type": "connect", "ip": ip, "hostname": hostname})
     buffer = ""
+    announced = False
     try:
         with conn:
+            if PI_TOKEN:
+                ok, buffer = _read_auth_line(conn, ip)
+                if not ok:
+                    logger.warning("Refused sensor connection from %s: missing or wrong SENSOR_DASHBOARD_PI_TOKEN", ip)
+                    return
+            _broadcast_threadsafe({"type": "connect", "ip": ip, "hostname": hostname})
+            announced = True
             while True:
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    try:
+                        hostname = _ingest_line(line, ip, hostname)
+                    except Exception:
+                        logger.exception("Unexpected error handling a line from %s; line dropped", ip)
                 data = conn.recv(4096).decode(errors="ignore")
                 if not data: break
                 buffer += data
@@ -484,24 +768,12 @@ def handle_pi_client(conn, addr):
                 if len(buffer) > TCP_MAX_BUFFER:
                     logger.warning("TCP buffer overflow from %s; closing connection", ip)
                     break
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    if len(line) > TCP_MAX_LINE:
-                        continue
-                    if line.strip():
-                        try:
-                            msg = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(msg, dict) and msg.get("type") == "sensor_data":
-                            msg["ip"] = ip
-                            if hostname == "Unknown Pi": hostname = get_hostname_from_ip(ip)
-                            msg["hostname"] = hostname
-                            latest_sensor_data[ip] = msg
-                            _broadcast_threadsafe(msg)
+    except OSError as e:
+        logger.info("Sensor connection from %s ended: %s", ip, e)
     finally:
-        if ip in latest_sensor_data: del latest_sensor_data[ip]
-        _broadcast_threadsafe({"type": "disconnect", "ip": ip})
+        if announced:
+            latest_sensor_data.pop(ip, None)
+            _broadcast_threadsafe({"type": "disconnect", "ip": ip})
 
 # --- Recording (append-as-you-go) ---
 class CsvRecorder:
@@ -565,30 +837,46 @@ class CsvRecorder:
             return self.filepath if self.rows_written else None
 
 
+def _sensor_row(ip, msg, tick_iso):
+    """One sensor-CSV row from a validated message. None values become blank cells."""
+    acc = msg.get("accel") or [None, None, None]
+    gyr = msg.get("gyro") or [None, None, None]
+    return {
+        "timestamp": tick_iso,
+        "received_at": msg.get("received_at"),
+        "hostname": msg.get("hostname") or get_hostname_from_ip(ip),
+        "temperature": msg.get("temp"),
+        "humidity": msg.get("humi"),
+        "lux_raw": msg.get("lux_raw"),
+        "uvi": msg.get("uv"),
+        "voc_raw": msg.get("voc"),
+        "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
+        "gyro_x": gyr[0], "gyro_y": gyr[1], "gyro_z": gyr[2],
+    }
+
+
 def recording_loop():
+    """Write one row per connected Pi every 100 ms while recording.
+
+    ``timestamp`` is this tick's time, ``received_at`` the arrival time of
+    the sample being written (the latest one from that Pi), so a Pi that
+    stopped sending shows up as a growing gap between the two columns.
+    A bad entry is logged and skipped; it never ends the loop.
+    """
     while recording_state["is_recording"]:
         now_iso = datetime.now(timezone.utc).isoformat()
         recorder = recording_state.get("sensor_recorder")
         if recorder is not None:
             for ip, msg in list(latest_sensor_data.items()):
-                acc = msg.get("accel", [None, None, None])
-                gyr = msg.get("gyro", [None, None, None])
-                recorder.write_row({
-                    "timestamp": now_iso,
-                    "hostname": msg.get("hostname") or get_hostname_from_ip(ip),
-                    "temperature": msg.get("temp"),
-                    "humidity": msg.get("humi"),
-                    "lux": msg.get("lux"),
-                    "uvi": msg.get("uv"),
-                    "voc_raw": msg.get("voc"),
-                    "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
-                    "gyro_x": gyr[0], "gyro_y": gyr[1], "gyro_z": gyr[2],
-                })
+                try:
+                    recorder.write_row(_sensor_row(ip, msg, now_iso))
+                except Exception:
+                    logger.exception("Skipped a sensor row for %s", ip)
         time.sleep(0.1)
 
 CSV_FIELDS = [
-    "timestamp", "hostname",
-    "temperature", "humidity", "lux", "uvi", "voc_raw",
+    "timestamp", "received_at", "hostname",
+    "temperature", "humidity", "lux_raw", "uvi", "voc_raw",
     "acc_x", "acc_y", "acc_z",
     "gyro_x", "gyro_y", "gyro_z",
 ]
@@ -805,7 +1093,7 @@ async def api_sensor_one(ip: str):
         raise HTTPException(status_code=404, detail=f"No data for {ip}")
     return latest_sensor_data[ip]
 
-@app.post("/api/start", dependencies=[Depends(require_token)])
+@app.post("/api/start", dependencies=STATE_CHANGING)
 async def api_start(req: StartRequest):
     if recording_state["is_recording"]:
         raise HTTPException(status_code=409, detail="Already recording")
@@ -835,7 +1123,7 @@ async def api_start(req: StartRequest):
 async def api_is_safe():
     return {"safe": True}
 
-@app.post("/api/end", dependencies=[Depends(require_token)])
+@app.post("/api/end", dependencies=STATE_CHANGING)
 async def api_end():
     if not recording_state["is_recording"]:
         raise HTTPException(status_code=409, detail="No active session")
@@ -845,7 +1133,7 @@ async def api_end():
     await manager.broadcast({"type": "recording_status", "is_recording": False, "path": saved_path})
     return {"status": "ended", "saved_path": saved_path}
 
-@app.post("/api/zero_tags")
+@app.post("/api/zero_tags", dependencies=STATE_CHANGING)
 async def api_zero_tags():
     """Capture all currently-tracked markers' poses as zero references."""
     now = time.time()
@@ -863,14 +1151,14 @@ async def api_zero_tags():
     return {"zeroed_ids": sorted(captured)}
 
 
-@app.post("/api/clear_zero")
+@app.post("/api/clear_zero", dependencies=STATE_CHANGING)
 async def api_clear_zero():
     with _zero_lock:
         _zero_refs.clear()
     return {"cleared": True}
 
 
-@app.post("/api/detect_tags")
+@app.post("/api/detect_tags", dependencies=STATE_CHANGING)
 async def api_detect_tags(
     image: UploadFile = File(...),
     tag_size_mm: float = Form(25.0),
@@ -910,7 +1198,7 @@ async def api_detect_tags(
     return {"markers": markers}
 
 
-@app.post("/api/upload_video")
+@app.post("/api/upload_video", dependencies=STATE_CHANGING)
 async def api_upload_video(
     video: UploadFile = File(...),
     timestamp: str = Form(...),
@@ -957,5 +1245,11 @@ if __name__ == "__main__":
         logger.warning(
             "Web server bound to all interfaces (%s) without SENSOR_DASHBOARD_TOKEN; "
             "set a token or use SENSOR_DASHBOARD_HOST=127.0.0.1 for local-only access.", WEB_HOST,
+        )
+    if not PI_ALLOWED_NETS and not PI_TOKEN:
+        logger.warning(
+            "Sensor listener %s:%d accepts data from any host on the network; set "
+            "SENSOR_DASHBOARD_PI_ALLOWED_IPS and/or SENSOR_DASHBOARD_PI_TOKEN to restrict it.",
+            TCP_HOST, TCP_PORT,
         )
     uvicorn.run(app, host=WEB_HOST, port=WEB_PORT)

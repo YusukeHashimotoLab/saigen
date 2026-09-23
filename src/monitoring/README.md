@@ -52,7 +52,7 @@ Two recording paths run independently:
 |---|---|---|---|
 | Temperature | BME280 | `0x76` | `temperature` (°C) |
 | Humidity | BME280 | `0x76` | `humidity` (%RH) |
-| Illuminance | TSL25911 | `0x29` | `lux` |
+| Visible + IR light (raw, **not lux**) | TSL25911 | `0x29` | `lux_raw` (channel-0 count) |
 | UV | LTR390 | `0x53` | `uvi` (UV index) |
 | VOC | SGP40 | `0x59` | `voc_raw` (raw signal, not the VOC index) |
 | 3-axis acceleration | ICM20948 | `0x68` | `acc_x`, `acc_y`, `acc_z` (g) |
@@ -77,6 +77,37 @@ column of older recordings holds values between 0 and about 0.098 instead of
 1 %RH: the 22-bit shift had already dropped the fractional part, so every
 recovered value is a whole number (rounded down). Recordings made with the
 fixed agent carry the full resolution of 1/1024 %RH.
+
+**The light column is a raw count, not lux, and was renamed on 2026-09-23.**
+The value recorded as `lux` in older files was never lux: it is the TSL25911's
+raw channel-0 (visible + IR) ADC count at the power-on gain (1x) and
+integration time (100 ms). It is now called `lux_raw`, in the Pi's messages,
+in `/api/sensors` and in the CSV. The dashboard still accepts the old `lux` key
+from an agent that has not been updated and stores it as `lux_raw`; an old CSV's
+`lux` column holds the same quantity.
+
+> **TODO (lux):** a lux value needs channel 1 (IR) as well as channel 0 and the
+> gain/integration-time scaling (the counts-per-lux factor from the AMS
+> TSL2591 application note, which the datasheet itself does not give). The
+> agent reads only channel 0 and leaves the gain/integration at their defaults,
+> so it does not compute lux. Add it only together with a reading of channel 1
+> (`0xB6`/`0xB7`) and, ideally, a comparison against a reference lux meter.
+
+**Failed sensor reads are `null`, not 0 (from 2026-09-23).** Each message from
+the Pi carries an `ok` object with one flag per sensor (`bme280`, `tsl25911`,
+`icm20948`, `ltr390`, `sgp40`). A sensor that did not answer, or whose SGP40
+reply failed its CRC-8 check, reports `null` and `ok: false`; in the CSV the
+cell is left empty. Older agents sent `0` for a failed read, so a `0` in an
+old recording may mean "no reading". A sensor that fails to initialise is
+retried with backoff (1 s, doubling to 60 s) while the others keep reporting;
+the agent exits with status 1 (and systemd restarts it) only if the I2C bus
+cannot be opened or no sensor answers at all.
+
+**SGP40 humidity compensation (from 2026-09-23).** The raw VOC signal is now
+measured with the BME280's humidity and temperature as compensation instead of
+the fixed defaults (50 %RH, 25 °C); if the BME280 reading is missing, the
+defaults are still used. `voc_raw` values of older recordings are therefore
+not directly comparable with new ones at humidity far from 50 %RH.
 
 ## Raspberry Pi setup
 
@@ -115,6 +146,7 @@ fixed agent carry the full resolution of 1/1024 %RH.
    ssh pi@<pi-host> "sudo tee /etc/sensor-agent.env >/dev/null" < src/monitoring/pi/sensor-agent.env.example
    ssh pi@<pi-host> "sudo chmod 600 /etc/sensor-agent.env"
    # then edit SENSOR_AGENT_PC_HOST on the Pi to your PC's real address
+   # (and SENSOR_AGENT_TOKEN if the PC sets SENSOR_DASHBOARD_PI_TOKEN)
    ```
 8. Install and enable the systemd service:
    ```bash
@@ -137,7 +169,8 @@ a Windows control PC:
 
 This copies `pi_sensor_agent.py`, renders `sensor-agent.service` with `%i`
 substituted for the given user, renders `/etc/sensor-agent.env` with the
-given `-PcHost`/`-PcPort`, and enables the service over SSH. Run it once per
+given `-PcHost`/`-PcPort` (and `-AgentToken`, written as `SENSOR_AGENT_TOKEN`,
+if you pass it), and enables the service over SSH. Run it once per
 Pi; after that, the agent starts automatically on every boot and reconnects
 to the PC whenever the connection drops. Re-run the script (or just update
 `/etc/sensor-agent.env` and `systemctl restart sensor-agent`) if the control
@@ -171,6 +204,33 @@ PC's address changes.
      page can authenticate its WebSocket; see [Dashboard security](#dashboard-security).
   5. Allow inbound TCP `8000` (dashboard) and `50001` (Pi sensor pushes)
      through the PC's firewall.
+- All dashboard environment variables are listed, with comments, in
+  [`dashboard.env.example`](dashboard.env.example).
+
+### Sensor ingestion (TCP :50001)
+
+The sensor listener has to accept connections from the LAN, since the Pi is a
+separate host. By default it accepts data from **any** host that can reach the
+port, and that data goes into the CSV. Two optional, independent restrictions
+(both env vars on the PC):
+
+- `SENSOR_DASHBOARD_PI_ALLOWED_IPS` — comma-separated IPs and/or CIDR
+  networks (e.g. `192.0.2.21,192.0.2.22` or `192.0.2.16/28`). A connection
+  from any other address is closed before anything is read. Give the Pis
+  fixed addresses (a DHCP reservation) if you use this. An entry that is not
+  an address makes the dashboard refuse to start.
+- `SENSOR_DASHBOARD_PI_TOKEN` — shared secret. The first line of every
+  connection must then be `{"type": "auth", "token": "<secret>"}`; the agent
+  sends it when `SENSOR_AGENT_TOKEN` is set in `/etc/sensor-agent.env`. A
+  connection without it, or with the wrong value, is closed. The token travels
+  in clear text, so it keeps out other hosts and misconfigured agents, not an
+  attacker who can sniff the LAN.
+
+The dashboard logs a warning at start-up while neither is set. Independently of
+both, every message is type-checked before use: numeric readings must be a
+number or `null`, `accel`/`gyro` `null` or a list of exactly three numbers or
+nulls, and only the known fields are kept. A malformed line is logged and
+dropped; the connection and the recording continue.
 
 ## Dashboard security
 
@@ -190,12 +250,31 @@ well as to the HTTP API:
   its choosing (cross-site WebSocket hijacking). A handshake with **no**
   `Origin` header is a non-browser client (curl, the flow runner, a test) and is
   accepted only from the local machine.
-- **Token on recording control.** When `SENSOR_DASHBOARD_TOKEN` is set,
-  `start_recording` / `stop_recording` over `/ws` require it — either as a
-  `?token=<secret>` query parameter on the WebSocket URL or as a `"token"`
-  field in the message — exactly as `POST /api/start` requires `X-Auth-Token`.
-  When no token is configured (the localhost-only default), those two actions
-  are restricted to local clients.
+- **Token on recording control and state-changing endpoints.** When
+  `SENSOR_DASHBOARD_TOKEN` is set, every endpoint that changes state or writes
+  a file requires it as an `X-Auth-Token` header: `POST /api/start`,
+  `/api/end`, `/api/upload_video`, `/api/detect_tags` (which appends to the
+  tags CSV), `/api/zero_tags` and `/api/clear_zero`. `start_recording` /
+  `stop_recording` over `/ws` require it too — either as a `?token=<secret>`
+  query parameter on the WebSocket URL or as a `"token"` field in the message.
+  The page sends the stored token with all of these. When no token is
+  configured (the localhost-only default), the two WebSocket actions are
+  restricted to local clients.
+- **Same-origin check on state-changing HTTP endpoints** (always on). The six
+  endpoints above answer `403` when the request carries an `Origin` (or, if
+  absent, a `Referer`) that is not this dashboard's own `scheme://host:port`.
+  Without it, any web page open in the operator's browser could submit an
+  HTML form to `http://localhost:8000/api/end` (no body needed) and stop a
+  running recording, or post junk to the upload/tag endpoints. Requests with
+  neither header are non-browser clients (the flow runner, the GUI, curl) and
+  pass this check.
+- **What is exposed without a token.** With `SENSOR_DASHBOARD_TOKEN` unset,
+  any *process on the control PC* (and, if you bind the web server to the
+  LAN, any host that can reach it) can start/stop recordings, upload a video
+  into the save directory and reset tag zeros through the HTTP API; the
+  same-origin check only stops other *web sites* in the browser. The read-only
+  endpoints (`/api/status`, `/api/sensors`) never need the token. Set a token
+  whenever the PC is shared or the dashboard is bound beyond loopback.
 - **Local-only privileged actions** (always on). `update_config`,
   `pick_folder` and `open_folder` are refused for any non-loopback client
   regardless of the token.
@@ -211,8 +290,11 @@ Rejected commands are reported back on the WebSocket as
 `{"type": "error", "action": ..., "detail": ...}` and appear in the page's log
 panel.
 - The TCP sensor listener (`SENSOR_DASHBOARD_TCP_HOST`, default `0.0.0.0`)
-  always listens on all interfaces, since the Pi is necessarily a separate
-  host — there is no loopback-only mode for it.
+  listens on all interfaces, since the Pi is necessarily a separate host; see
+  [Sensor ingestion](#sensor-ingestion-tcp-50001) for its allow-list and token.
+- **Device names are rendered as text.** Hostnames come from mDNS
+  announcements, which any host on the LAN can make; the page escapes them
+  before inserting them, so a crafted name cannot inject markup or script.
 
 ## Running the dashboard on the PC
 
@@ -231,7 +313,12 @@ Port numbers come from `src/monitoring/config.yaml` if present, else from
 [`config.example.yaml`](config.example.yaml), else from the built-in defaults
 `web_port: 8000` / `tcp_port: 50001`. `config.yaml` is gitignored — copy
 `config.example.yaml` to `config.yaml` in this directory to override the
-ports locally without touching version control. Whatever `tcp_port` is
+ports locally without touching version control. The first of those files that
+exists is used; if it cannot be parsed, its top level (or its
+`sensor_dashboard` section) is not a mapping, or a port is not an integer in
+1-65535, the dashboard refuses to start with a `DashboardConfigError` naming
+the file, instead of silently falling back to the defaults (which would leave
+the Pis pushing to a port nobody listens on). Whatever `tcp_port` is
 configured on the PC must match `SENSOR_AGENT_PC_PORT` in every Pi's
 `/etc/sensor-agent.env`.
 
@@ -252,23 +339,29 @@ named from the session start time and an optional experiment-name prefix
 The sensor CSV is written by sampling `latest_sensor_data` (the most recent
 message received from each Pi) every 100 ms, regardless of each Pi's own
 push rate — so a slow or bursty Pi still produces one row per tick, holding
-its last known value. See [`examples/zif8/`](../../examples/zif8/) for sample
+its last known value. Each row carries both the tick time (`timestamp`) and
+the arrival time of the sample it holds (`received_at`, from 2026-09-23), so
+a held or stale value is recognisable. See [`examples/zif8/`](../../examples/zif8/) for sample
 files (`sensor_session_sample.csv`, `sensor_session_sample_tags.csv`) showing
-this layout; they are placeholders, not measurements from an actual run.
+the older layout (they still show the `lux` column and no `received_at`);
+they are placeholders, not measurements from an actual run.
 
 ### Sensor CSV columns
 
 | Column | Meaning |
 |---|---|
-| `timestamp` | ISO 8601, UTC, with offset (e.g. `2026-01-01T03:00:00.000000+00:00`) |
+| `timestamp` | Recording tick, ISO 8601, UTC, with offset (e.g. `2026-01-01T03:00:00.000000+00:00`) |
+| `received_at` | Arrival time of the sample in this row, ISO 8601, UTC (absent before 2026-09-23) |
 | `hostname` | Reporting Pi's hostname |
 | `temperature` | °C |
 | `humidity` | %RH; divided by 1024 (0-0.098) in every recording made before 2026-09-23, see [Measured quantities](#measured-quantities) |
-| `lux` | Illuminance |
+| `lux_raw` | TSL25911 channel-0 raw count (gain 1x, 100 ms), **not lux**; named `lux` before 2026-09-23, see [Measured quantities](#measured-quantities) |
 | `uvi` | UV index (float); `0` in every recording made before 2026-09-08, see [Measured quantities](#measured-quantities) |
 | `voc_raw` | VOC, raw sensor signal |
 | `acc_x`, `acc_y`, `acc_z` | Acceleration, g |
 | `gyro_x`, `gyro_y`, `gyro_z` | Angular velocity, deg/s |
+
+An empty cell is a failed or missing reading (`null` from the Pi).
 
 ### Tags CSV columns
 
@@ -304,6 +397,14 @@ saved_path = recorder.stop()
 above the setup; it is platform- and machine-dependent (probe with a short
 OpenCV script if recordings come from the wrong camera). The recorder runs on
 its own background thread and paces frames to the camera's own reported FPS.
+
+The worker thread owns the capture and the writer and releases both itself
+when it ends. `stop(timeout=5.0)` signals it and waits; if the worker is still
+running at the timeout (typically a `read()` blocked on a camera that went
+away), `stop()` does **not** release anything under it, logs an error, sets
+`recorder.last_stop_clean = False` and still returns the path; the file is
+finalised when the worker eventually returns. After a normal stop,
+`last_stop_clean` is `True`.
 
 ## HTTP API
 

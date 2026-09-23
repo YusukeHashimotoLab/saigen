@@ -9,11 +9,16 @@ can read sensor values and control recording over HTTP.
   From the same PC: `http://localhost:8000`
 - Format: JSON request and response bodies.
 - Authentication: none by default (LAN-internal use is assumed). If the
-  `SENSOR_DASHBOARD_TOKEN` environment variable is set on the PC, `POST
-  /api/start` and `POST /api/end` require a matching `X-Auth-Token` request
-  header, and the WebSocket's recording commands require the same token — see
-  [Authentication](#authentication) below. This is required whenever the
-  dashboard is bound to anything other than `127.0.0.1`.
+  `SENSOR_DASHBOARD_TOKEN` environment variable is set on the PC, every
+  state-changing `POST` (`/api/start`, `/api/end`, `/api/upload_video`,
+  `/api/detect_tags`, `/api/zero_tags`, `/api/clear_zero`) requires a matching
+  `X-Auth-Token` request header, and the WebSocket's recording commands
+  require the same token — see [Authentication](#authentication) below. This
+  is required whenever the dashboard is bound to anything other than
+  `127.0.0.1`.
+- Those six `POST` endpoints also refuse (HTTP 403) a browser request whose
+  `Origin`/`Referer` is another site; clients that send neither header are
+  unaffected.
 
 ## Endpoints
 
@@ -41,12 +46,20 @@ Latest sensor reading from every connected Pi (dict keyed by Pi IP address).
     "temp": 24.3, "humi": 55.2,
     "accel": [0.01, -0.02, 9.81],
     "gyro":  [0.0, 0.0, 0.0],
-    "lux": 320, "uv": 0.42, "voc": 30000,
+    "lux_raw": 320, "uv": 0.42, "voc": 30000,
+    "ok": {"bme280": true, "tsl25911": true, "icm20948": true, "ltr390": true, "sgp40": true},
+    "model": "BME280 (T/H)",
     "ip": "192.0.2.10",
-    "hostname": "raspberrypi.local"
+    "hostname": "raspberrypi.local",
+    "received_at": "2026-01-01T03:00:00.123456+00:00"
   }
 }
 ```
+
+Any reading can be `null` (a failed read on the Pi; the matching `ok` flag is
+then `false`). `lux_raw` is the TSL25911 channel-0 raw count, not lux; it was
+called `lux` before 2026-09-23. `received_at` is when the dashboard received
+this sample.
 
 ### `GET /api/sensors/{ip}`
 
@@ -94,13 +107,15 @@ plain HTTP/JSON and can be called by any client:
 
 | Method / path | Purpose |
 |---|---|
-| `POST /api/detect_tags` | AprilTag pose estimation from a single uploaded camera frame |
+| `POST /api/detect_tags` | AprilTag pose estimation from a single uploaded camera frame (appends to the tags CSV while recording) |
 | `POST /api/zero_tags` | Capture the currently-tracked AprilTag poses as zero references |
 | `POST /api/clear_zero` | Clear the zero references |
 | `POST /api/upload_video` | Save a browser-recorded (webm) video clip to the current save directory. Bodies over 200 MB (`SENSOR_DASHBOARD_MAX_UPLOAD_BYTES`) are rejected with HTTP 413 |
 | `GET /api/is_safe` (also `GET /is_safe`) | Liveness check, always `{"safe": true}` |
 
-See the interactive docs (below) for their exact request/response schemas.
+All four need `X-Auth-Token` when `SENSOR_DASHBOARD_TOKEN` is set and refuse
+cross-origin browser requests, like `/api/start` and `/api/end`. See the
+interactive docs (below) for their exact request/response schemas.
 
 ## WebSocket `/ws`
 
@@ -139,8 +154,9 @@ dashboard URL and remembers it in `localStorage` under `sensorDashboardToken`.
 ## Authentication
 
 Set `SENSOR_DASHBOARD_TOKEN` in the dashboard PC's environment before
-starting `launch_sensor_dashboard.py` to require a token on `/api/start` and
-`/api/end`:
+starting `launch_sensor_dashboard.py` to require a token on `/api/start`,
+`/api/end`, `/api/upload_video`, `/api/detect_tags`, `/api/zero_tags` and
+`/api/clear_zero`:
 
 ```
 X-Auth-Token: <value of SENSOR_DASHBOARD_TOKEN>
@@ -152,6 +168,14 @@ unrelated to the Host-header allow list
 (`SENSOR_DASHBOARD_ALLOWED_HOSTS`), which is a separate, always-on protection
 against DNS rebinding — though the WebSocket `Origin` check reuses that same
 host list.
+
+Independently of the token, those six endpoints check `Origin` (or, if it is
+absent, `Referer`): a value that is not this dashboard's own
+`scheme://host:port` gets HTTP 403. This stops another web site open in the
+operator's browser from, for example, submitting a form to `/api/end`. With no
+token configured, any local process (or LAN host, if the server is bound to the
+LAN) that sends neither header can still call these endpoints — set a token if
+that matters.
 
 ## Example calls
 

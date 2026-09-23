@@ -53,9 +53,14 @@ class VideoRecorder:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._frames_written = 0
+        # False after a stop() whose worker was still running at the timeout.
+        self.last_stop_clean: Optional[bool] = None
 
     def start(self) -> bool:
         """Open the camera and start the recording thread. Returns False on failure."""
+        if self._thread is not None:
+            logger.error("VideoRecorder.start() called while already recording: %s", self.output_path)
+            return False
         cap = cv2.VideoCapture(self.camera_index, _platform_backend())
         if not cap.isOpened():
             logger.error(f"Could not open video camera index={self.camera_index}")
@@ -79,9 +84,11 @@ class VideoRecorder:
 
         self._cap = cap
         self._writer = writer
-        self._stop.clear()
+        # A fresh event per run: a worker left over from an unclean stop() keeps
+        # its own (set) event and cannot be revived by this start().
+        self._stop = threading.Event()
         self._frames_written = 0
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, args=(self._stop, cap, writer), daemon=True)
         self._thread.start()
         logger.info(
             f"Started video recording: {self.output_path} "
@@ -89,37 +96,66 @@ class VideoRecorder:
         )
         return True
 
-    def _loop(self):
+    def _loop(self, stop_event=None, cap=None, writer=None):
+        """Worker: capture and write frames until stopped, then release.
+
+        The worker owns the capture and the writer: they are released here, in
+        ``finally``, and never by stop(), so a frame being written while stop()
+        times out cannot race a released VideoWriter.
+        """
+        stop_event = stop_event or self._stop
+        cap = cap if cap is not None else self._cap
+        writer = writer if writer is not None else self._writer
         period = 1.0 / max(self.fps, 1.0)
         next_tick = time.monotonic()
-        while not self._stop.is_set():
-            ok, frame = self._cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            self._writer.write(frame)
-            self._frames_written += 1
-            # pacing to approximate a constant frame rate
-            next_tick += period
-            sleep_for = next_tick - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                next_tick = time.monotonic()
+        try:
+            while not stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.01)
+                    continue
+                writer.write(frame)
+                self._frames_written += 1
+                # pacing to approximate a constant frame rate
+                next_tick += period
+                sleep_for = next_tick - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_tick = time.monotonic()
+        except Exception:
+            logger.exception("Video recording worker failed: %s", self.output_path)
+        finally:
+            for name, res in (("writer", writer), ("capture", cap)):
+                try:
+                    if res is not None:
+                        res.release()
+                except Exception:
+                    logger.exception("Could not release video %s", name)
 
-    def stop(self) -> Optional[str]:
-        """Stop recording and return the saved path. Returns None if never started."""
+    def stop(self, timeout: float = 5.0) -> Optional[str]:
+        """Stop recording and return the saved path. Returns None if never started.
+
+        If the worker does not finish within ``timeout`` seconds (e.g. a
+        ``VideoCapture.read()`` blocked on a vanished camera), the capture and
+        writer are left to the worker, which releases them when it returns;
+        this call logs an error, sets ``last_stop_clean`` to False and still
+        returns the path (the file may be incomplete until the worker ends).
+        """
         if self._thread is None:
             return None
         self._stop.set()
-        self._thread.join(timeout=5.0)
-        if self._writer is not None:
-            self._writer.release()
-        if self._cap is not None:
-            self._cap.release()
-        logger.info(
-            f"Stopped video recording: {self.output_path} ({self._frames_written} frames)"
-        )
+        self._thread.join(timeout=timeout)
+        self.last_stop_clean = not self._thread.is_alive()
+        if self.last_stop_clean:
+            logger.info(
+                f"Stopped video recording: {self.output_path} ({self._frames_written} frames)"
+            )
+        else:
+            logger.error(
+                f"Video recording worker did not stop within {timeout:.1f} s: {self.output_path} "
+                f"({self._frames_written} frames so far); it will release the file when it returns"
+            )
         self._thread = None
         self._writer = None
         self._cap = None

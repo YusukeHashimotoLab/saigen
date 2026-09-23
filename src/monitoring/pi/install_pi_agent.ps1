@@ -24,6 +24,10 @@
   TCP port the dashboard listens on. Must match `sensor_dashboard.tcp_port`
   in src/monitoring/config.yaml on the PC. Default: 50001.
 
+.PARAMETER AgentToken
+  Optional shared secret, written as SENSOR_AGENT_TOKEN. Must equal
+  SENSOR_DASHBOARD_PI_TOKEN on the PC. Omit it if the PC sets no token.
+
 .EXAMPLE
   .\install_pi_agent.ps1 -User pi -HostName raspberrypi.local -PcHost 192.0.2.10
 #>
@@ -31,7 +35,8 @@ param(
     [Parameter(Mandatory=$true)][string]$User,
     [Parameter(Mandatory=$true)][string]$HostName,
     [Parameter(Mandatory=$true)][string]$PcHost,
-    [int]$PcPort = 50001
+    [int]$PcPort = 50001,
+    [string]$AgentToken = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,6 +60,7 @@ $envText = @"
 SENSOR_AGENT_PC_HOST=$PcHost
 SENSOR_AGENT_PC_PORT=$PcPort
 "@
+if ($AgentToken) { $envText += "`nSENSOR_AGENT_TOKEN=$AgentToken" }
 $tmpEnv = New-TemporaryFile
 try {
     Set-Content -Path $tmpService -Value $serviceText -Encoding utf8 -NoNewline

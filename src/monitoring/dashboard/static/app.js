@@ -111,6 +111,32 @@ function getDashboardToken() {
     }
 }
 
+// Headers for the dashboard's own POSTs to /api/*. The server requires the
+// token there too whenever SENSOR_DASHBOARD_TOKEN is set.
+function authHeaders() {
+    const token = getDashboardToken();
+    return token ? { 'X-Auth-Token': token } : {};
+}
+
+// Everything that reaches the page from the network (mDNS device names in
+// particular, which any host on the LAN can announce) is inserted as text,
+// never as markup: escapeHtml() for template strings, textContent elsewhere.
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// Device IPs are interpolated into onclick handlers below, so only accept
+// strings that can be an IPv4/IPv6 address.
+function isSafeIp(ip) { return typeof ip === 'string' && /^[0-9A-Fa-f:.]{1,45}$/.test(ip); }
+
+// Sensor values may be null (failed read on the Pi). Charts get null (a gap),
+// readouts get "--"; nothing is shown as 0 unless the sensor reported 0.
+function num(v) { return (typeof v === 'number' && Number.isFinite(v)) ? v : null; }
+function fmt(v, digits) { const n = num(v); return n === null ? '--' : n.toFixed(digits); }
+function vec3(v) { return Array.isArray(v) && v.length === 3 ? v.map(num) : [null, null, null]; }
+
 function connect() {
     const token = getDashboardToken();
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -130,7 +156,7 @@ function connect() {
 
 function handleMessage(msg) {
     if (msg.type === "discovery") updateDiscovery(msg.devices);
-    else if (msg.type === "connect") addDevice(msg.ip, msg.hostname);
+    else if (msg.type === "connect") { if (isSafeIp(msg.ip)) addDevice(msg.ip, String(msg.hostname ?? 'Unknown Pi')); }
     else if (msg.type === "disconnect") removeDevice(msg.ip);
     else if (msg.type === "sensor_data") updateSensorData(msg);
     else if (msg.type === "recording_status") setRecordingUI(msg.is_recording, msg.path, msg.session_timestamp, msg.prefix);
@@ -181,7 +207,7 @@ function createChart(id, labelConfigs, dualAxis = false, onClickCallback = null,
                 tooltip: {
                     enabled: isAdvanced, backgroundColor: 'rgba(2, 7, 37, 0.95)', titleFont: { size: 12, weight: '800' },
                     bodyFont: { size: 13, weight: '700', family: 'JetBrains Mono' }, padding: 12, cornerRadius: 10, borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, displayColors: true,
-                    callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)}` }
+                    callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${fmt(ctx.parsed.y, 2)}` }
                 },
                 zoom: isAdvanced ? {
                     pan: { enabled: true, mode: 'x', onPan: () => { chartObj.isFollowing = false; } },
@@ -230,7 +256,7 @@ function switchTab(viewId) {
 function getHistoryRef(ip, type) {
     const h = devices[ip].history;
     if (type === 'env') return { labels: h.labels, datasets: [h.temp, h.humi, h.voc] };
-    if (type === 'light') return { labels: h.labels, datasets: [h.lux, h.uv] };
+    if (type === 'light') return { labels: h.labels, datasets: [h.luxRaw, h.uv] };
     if (type === 'acc') return { labels: h.labels, datasets: [h.accX, h.accY, h.accZ] };
     if (type === 'gyro') return { labels: h.labels, datasets: [h.gyroX, h.gyroY, h.gyroZ] };
     return null;
@@ -244,7 +270,7 @@ function openDeviceTab(ip) {
         tabBtn.id = `tab-${viewId}`;
         tabBtn.className = "tab-btn";
         tabBtn.onclick = () => switchTab(viewId);
-        tabBtn.innerHTML = `${devices[ip].hostname.replace('.local','').toUpperCase()} <span class="close-tab-btn" onclick="closeDeviceTab('${ip}', event)">✕</span>`;
+        tabBtn.innerHTML = `${escapeHtml(devices[ip].hostname.replace('.local','').toUpperCase())} <span class="close-tab-btn" onclick="closeDeviceTab('${ip}', event)">✕</span>`;
         tabBar.appendChild(tabBtn);
 
         const deviceView = document.createElement('div');
@@ -252,7 +278,7 @@ function openDeviceTab(ip) {
         deviceView.className = "device-view hidden space-y-10";
         deviceView.innerHTML = `
             <div class="flex items-center justify-between">
-                <div><h2 class="text-3xl font-black tracking-tighter">${devices[ip].hostname}</h2><p style="color:var(--text-dim); font-size:11px; font-weight:600; letter-spacing:1px">${ip} • NODE ANALYSIS</p></div>
+                <div><h2 class="text-3xl font-black tracking-tighter">${escapeHtml(devices[ip].hostname)}</h2><p style="color:var(--text-dim); font-size:11px; font-weight:600; letter-spacing:1px">${escapeHtml(ip)} • NODE ANALYSIS</p></div>
                 <div style="display:flex; gap:12px"><button onclick="resetZoom('${ip}', null, 'indiv')" class="btn-ghost">RESET & FOLLOW</button><button onclick="togglePause('${ip}')" class="pause-btn-${ipSafe} btn-primary">PAUSE</button></div>
             </div>
             <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:30px">
@@ -264,7 +290,7 @@ function openDeviceTab(ip) {
         viewDeviceContainer.appendChild(deviceView);
         devices[ip].charts.indiv = {
             env: createChart(`chart-indiv-${ipSafe}-env`, [{label:'Temp', color:'#ff5555'}, {label:'Humi', color:'#5555ff'}, {label:'VOC', color:'#ffff55', yAxis:'y1'}], true, null, true, getHistoryRef(ip, 'env')),
-            light: createChart(`chart-indiv-${ipSafe}-light`, [{label:'Lux', color:'#ffaa00'}, {label:'UV', color:'#aa00ff'}], false, null, true, getHistoryRef(ip, 'light')),
+            light: createChart(`chart-indiv-${ipSafe}-light`, [{label:'Light ch0 (raw)', color:'#ffaa00'}, {label:'UV', color:'#aa00ff'}], false, null, true, getHistoryRef(ip, 'light')),
             acc: createChart(`chart-indiv-${ipSafe}-acc`, [{label:'X', color:'#ff5555'}, {label:'Y', color:'#55ff55'}, {label:'Z', color:'#5555ff'}], false, null, true, getHistoryRef(ip, 'acc')),
             gyro: createChart(`chart-indiv-${ipSafe}-gyro`, [{label:'X', color:'#ff5555'}, {label:'Y', color:'#55ff55'}, {label:'Z', color:'#5555ff'}], false, null, true, getHistoryRef(ip, 'gyro'))
         };
@@ -284,7 +310,7 @@ function openSensorDetailTab(ip, type) {
         detailView.id = `view-${viewId}`; detailView.className = "device-view hidden space-y-8";
         detailView.innerHTML = `
             <div class="flex items-center justify-between">
-                <div><h2 class="text-4xl font-black tracking-tighter">${type.toUpperCase()}</h2><p style="color:var(--text-dim); font-size:12px; font-weight:600; letter-spacing:1px; margin-top:4px">${devices[ip].hostname}</p></div>
+                <div><h2 class="text-4xl font-black tracking-tighter">${type.toUpperCase()}</h2><p style="color:var(--text-dim); font-size:12px; font-weight:600; letter-spacing:1px; margin-top:4px">${escapeHtml(devices[ip].hostname)}</p></div>
                 <div style="display:flex; gap:12px"><button onclick="resetZoom('${ip}', '${type}', 'detail')" class="btn-ghost">RESET & FOLLOW</button><button onclick="togglePause('${ip}')" class="pause-btn-${ipSafe} btn-primary">PAUSE</button></div>
             </div>
             <div class="glass-card" style="height:72vh; position:relative; overflow:hidden; display:flex; flex-direction:column;">
@@ -294,7 +320,7 @@ function openSensorDetailTab(ip, type) {
         viewDeviceContainer.appendChild(detailView);
         let configs, dual = false;
         if (type === 'env') { configs = [{label:'Temp', color:'#ff5555'}, {label:'Humi', color:'#5555ff'}, {label:'VOC', color:'#ffff55', yAxis:'y1'}]; dual = true; }
-        else if (type === 'light') configs = [{label:'Lux', color:'#ffaa00'}, {label:'UV', color:'#aa00ff'}];
+        else if (type === 'light') configs = [{label:'Light ch0 (raw)', color:'#ffaa00'}, {label:'UV', color:'#aa00ff'}];
         else configs = [{label:'X', color:'#ff5555'}, {label:'Y', color:'#55ff55'}, {label:'Z', color:'#5555ff'}];
         if (!devices[ip].charts.detail) devices[ip].charts.detail = {};
         devices[ip].charts.detail[type] = createChart(`chart-detail-${ipSafe}-${type}`, configs, dual, null, true, getHistoryRef(ip, type));
@@ -327,16 +353,16 @@ function addDevice(ip, hostname) {
     const ipSafe = ip.replace(/\./g, '-');
     const item = document.createElement('div');
     item.id = `card-${ipSafe}`; item.className = "device-status-item";
-    item.innerHTML = `<div style="display:flex; align-items:center; gap:20px"><div style="width:10px; height:10px; border-radius:50%; background:var(--accent-green); box-shadow: 0 0 10px var(--accent-green)"></div><div><h4 style="font-weight:800; font-size:16px">${hostname}</h4><p style="font-size:11px; color:var(--text-dim); font-weight:600; font-family:'JetBrains Mono'">${ip}</p></div></div><button onclick="switchTab('unified')" class="btn-primary">MONITOR LIVE</button>`;
+    item.innerHTML = `<div style="display:flex; align-items:center; gap:20px"><div style="width:10px; height:10px; border-radius:50%; background:var(--accent-green); box-shadow: 0 0 10px var(--accent-green)"></div><div><h4 style="font-weight:800; font-size:16px">${escapeHtml(hostname)}</h4><p style="font-size:11px; color:var(--text-dim); font-weight:600; font-family:'JetBrains Mono'">${escapeHtml(ip)}</p></div></div><button onclick="switchTab('unified')" class="btn-primary">MONITOR LIVE</button>`;
     deviceContainer.appendChild(item);
 
-    devices[ip] = { hostname, isPaused: false, smoothVoc: null, tabOpen: false, history: { labels: [], temp: [], humi: [], voc: [], lux: [], uv: [], accX: [], accY: [], accZ: [], gyroX: [], gyroY: [], gyroZ: [] }, charts: { unified: null, indiv: null, detail: {} } };
+    devices[ip] = { hostname, isPaused: false, smoothVoc: null, tabOpen: false, history: { labels: [], temp: [], humi: [], voc: [], luxRaw: [], uv: [], accX: [], accY: [], accZ: [], gyroX: [], gyroY: [], gyroZ: [] }, charts: { unified: null, indiv: null, detail: {} } };
 
     const unifiedSection = document.createElement('div');
     unifiedSection.id = `unified-sec-${ipSafe}`; unifiedSection.className = "glass-card";
     unifiedSection.innerHTML = `
         <div class="flex items-center justify-between" style="margin-bottom:30px; border-bottom:1px solid var(--border-glass); padding-bottom:20px">
-            <div style="display:flex; align-items:center; gap:15px"><div style="width:40px; height:40px; background:rgba(255,255,255,0.05); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:20px">📱</div><div><h3 class="text-xl font-bold">${hostname}</h3><p style="font-size:10px; color:var(--text-dim); font-family:'JetBrains Mono'">${ip}</p></div></div>
+            <div style="display:flex; align-items:center; gap:15px"><div style="width:40px; height:40px; background:rgba(255,255,255,0.05); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:20px">📱</div><div><h3 class="text-xl font-bold">${escapeHtml(hostname)}</h3><p style="font-size:10px; color:var(--text-dim); font-family:'JetBrains Mono'">${escapeHtml(ip)}</p></div></div>
             <div style="display:flex; gap:10px"><button onclick="togglePause('${ip}')" class="pause-btn-${ipSafe} btn-ghost">PAUSE</button><button onclick="openDeviceTab('${ip}')" class="btn-primary">FULL ANALYSIS</button></div>
         </div>
         <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:24px">
@@ -352,31 +378,53 @@ function addDevice(ip, hostname) {
     updateActiveCount();
 }
 
+// Called on the server's "disconnect" message (it was referenced but never
+// defined before, so every Pi disconnect threw in the message handler).
+function removeDevice(ip) {
+    if (!devices[ip]) return;
+    const ipSafe = ip.replace(/\./g, '-');
+    if (devices[ip].tabOpen) closeDeviceTab(ip);
+    Object.keys(devices[ip].charts.detail || {}).forEach(type => closeSensorDetailTab(`detail-${ipSafe}-${type}`, ip, type));
+    Object.values(devices[ip].charts.unified || {}).forEach(c => c && c.chart.destroy());
+    document.getElementById(`card-${ipSafe}`)?.remove();
+    document.getElementById(`unified-sec-${ipSafe}`)?.remove();
+    delete devices[ip];
+    updateActiveCount();
+    addLog(`Node ${ip} disconnected.`);
+}
+
 function updateSensorData(msg) {
     const ip = msg.ip; if (!devices[ip]) return;
-    const dev = devices[ip], ipSafe = ip.replace(/\./g, '-'), rawVoc = msg.voc || 0;
-    if (dev.smoothVoc === null) dev.smoothVoc = rawVoc;
-    else dev.smoothVoc = (rawVoc * VOC_SMOOTHING) + (dev.smoothVoc * (1 - VOC_SMOOTHING));
-    const displayVoc = Math.round(dev.smoothVoc), acc = msg.accel || [0,0,0], gyr = msg.gyro || [0,0,0], now = new Date().toLocaleTimeString('en-GB', {hour12:false});
-    const h = dev.history; h.labels.push(now); h.temp.push(msg.temp||0); h.humi.push(msg.humi||0); h.voc.push(displayVoc); h.lux.push(msg.lux||0); h.uv.push(msg.uv||0); h.accX.push(acc[0]); h.accY.push(acc[1]); h.accZ.push(acc[2]); h.gyroX.push(gyr[0]); h.gyroY.push(gyr[1]); h.gyroZ.push(gyr[2]);
-    let didShift = false; if (h.labels.length > DATA_BUFFER_LIMIT) { h.labels.shift(); h.temp.shift(); h.humi.shift(); h.voc.shift(); h.lux.shift(); h.uv.shift(); h.accX.shift(); h.accY.shift(); h.accZ.shift(); h.gyroX.shift(); h.gyroY.shift(); h.gyroZ.shift(); didShift = true; }
+    const dev = devices[ip], ipSafe = ip.replace(/\./g, '-'), rawVoc = num(msg.voc);
+    if (rawVoc !== null) {
+        if (dev.smoothVoc === null) dev.smoothVoc = rawVoc;
+        else dev.smoothVoc = (rawVoc * VOC_SMOOTHING) + (dev.smoothVoc * (1 - VOC_SMOOTHING));
+    }
+    const temp = num(msg.temp), humi = num(msg.humi), luxRaw = num(msg.lux_raw ?? msg.lux), uv = num(msg.uv);
+    const vocShown = rawVoc === null ? null : Math.round(dev.smoothVoc);
+    const displayVoc = vocShown === null ? '--' : vocShown;
+    const acc = vec3(msg.accel), gyr = vec3(msg.gyro), now = new Date().toLocaleTimeString('en-GB', {hour12:false});
+    const h = dev.history; h.labels.push(now); h.temp.push(temp); h.humi.push(humi); h.voc.push(vocShown); h.luxRaw.push(luxRaw); h.uv.push(uv); h.accX.push(acc[0]); h.accY.push(acc[1]); h.accZ.push(acc[2]); h.gyroX.push(gyr[0]); h.gyroY.push(gyr[1]); h.gyroZ.push(gyr[2]);
+    let didShift = false; if (h.labels.length > DATA_BUFFER_LIMIT) { h.labels.shift(); h.temp.shift(); h.humi.shift(); h.voc.shift(); h.luxRaw.shift(); h.uv.shift(); h.accX.shift(); h.accY.shift(); h.accZ.shift(); h.gyroX.shift(); h.gyroY.shift(); h.gyroZ.shift(); didShift = true; }
     const set = (id, val) => { const e = document.getElementById(id); if(e) e.textContent = val; };
-    set(`val-unified-${ipSafe}-env`, `${(msg.temp||0).toFixed(1)}° / ${displayVoc} VOC`);
-    set(`val-unified-${ipSafe}-acc`, `Z: ${acc[2].toFixed(2)}`);
+    const accText = `X:${fmt(acc[0], 2)} Y:${fmt(acc[1], 2)} Z:${fmt(acc[2], 2)}`;
+    const gyrText = `X:${fmt(gyr[0], 1)} Y:${fmt(gyr[1], 1)} Z:${fmt(gyr[2], 1)}`;
+    set(`val-unified-${ipSafe}-env`, `${fmt(temp, 1)}° / ${displayVoc} VOC`);
+    set(`val-unified-${ipSafe}-acc`, `Z: ${fmt(acc[2], 2)}`);
     if (dev.tabOpen) {
-        set(`pill-device-${ipSafe}-env`, `${(msg.temp||0).toFixed(1)}° / ${(msg.humi||0).toFixed(0)}% / ${displayVoc} VOC`);
-        set(`pill-device-${ipSafe}-light`, `Lux: ${msg.lux||0} / UV: ${msg.uv||0}`);
-        set(`pill-device-${ipSafe}-acc`, `X:${acc[0].toFixed(2)} Y:${acc[1].toFixed(2)} Z:${acc[2].toFixed(2)}`);
-        set(`pill-device-${ipSafe}-gyro`, `X:${gyr[0].toFixed(1)} Y:${gyr[1].toFixed(1)} Z:${gyr[2].toFixed(1)}`);
+        set(`pill-device-${ipSafe}-env`, `${fmt(temp, 1)}° / ${fmt(humi, 0)}% / ${displayVoc} VOC`);
+        set(`pill-device-${ipSafe}-light`, `Ch0 raw: ${luxRaw ?? '--'} / UV: ${uv ?? '--'}`);
+        set(`pill-device-${ipSafe}-acc`, accText);
+        set(`pill-device-${ipSafe}-gyro`, gyrText);
     }
     if (dev.charts.detail) {
         Object.keys(dev.charts.detail).forEach(type => {
             const el = document.getElementById(`val-detail-${ipSafe}-${type}`);
             if (el) {
-                if (type === 'env') el.textContent = `${(msg.temp||0).toFixed(1)}° / ${displayVoc} VOC / ${(msg.humi||0).toFixed(0)}% HUM`;
-                else if (type === 'light') el.textContent = `${msg.lux||0} LUX / ${msg.uv||0} UV`;
-                else if (type === 'acc') el.textContent = `X:${acc[0].toFixed(2)} Y:${acc[1].toFixed(2)} Z:${acc[2].toFixed(2)}`;
-                else if (type === 'gyro') el.textContent = `X:${gyr[0].toFixed(1)} Y:${gyr[1].toFixed(1)} Z:${gyr[2].toFixed(1)}`;
+                if (type === 'env') el.textContent = `${fmt(temp, 1)}° / ${displayVoc} VOC / ${fmt(humi, 0)}% HUM`;
+                else if (type === 'light') el.textContent = `${luxRaw ?? '--'} CH0 RAW / ${uv ?? '--'} UV`;
+                else if (type === 'acc') el.textContent = accText;
+                else if (type === 'gyro') el.textContent = gyrText;
             }
         });
     }
@@ -558,7 +606,7 @@ async function uploadWebcamRecording() {
     fd.append('prefix', currentSessionPrefix || '');
     addLog(`Uploading webcam (${(blob.size/1024/1024).toFixed(1)} MB)...`);
     try {
-        const r = await fetch('/api/upload_video', { method: 'POST', body: fd });
+        const r = await fetch('/api/upload_video', { method: 'POST', body: fd, headers: authHeaders() });
         const j = await r.json();
         const fname = (j.path || '').split(/[\\/]/).pop();
         addLog(`Webcam saved: ${fname}`);
@@ -649,7 +697,7 @@ function startTrackingLoop() {
         trackingInflight = true;
         const tStart = performance.now();
         try {
-            const r = await fetch('/api/detect_tags', { method: 'POST', body: fd });
+            const r = await fetch('/api/detect_tags', { method: 'POST', body: fd, headers: authHeaders() });
             const j = await r.json();
             renderTrackingResults(j.markers || [], w, h);
             updateTrackingFps(performance.now() - tStart);
@@ -880,7 +928,7 @@ function setHeaderMode(isRelative) {
 
 async function setZeroAll() {
     try {
-        const r = await fetch('/api/zero_tags', { method: 'POST' });
+        const r = await fetch('/api/zero_tags', { method: 'POST', headers: authHeaders() });
         const j = await r.json();
         zeroedIds = new Set((j.zeroed_ids || []).map(Number));
         const status = document.getElementById('zero-status');
@@ -899,7 +947,7 @@ async function setZeroAll() {
 
 async function clearZero() {
     try {
-        await fetch('/api/clear_zero', { method: 'POST' });
+        await fetch('/api/clear_zero', { method: 'POST', headers: authHeaders() });
         zeroedIds.clear();
         const status = document.getElementById('zero-status');
         if (status) status.textContent = 'no zero set';
