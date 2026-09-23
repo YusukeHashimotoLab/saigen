@@ -14,6 +14,7 @@ L1層: 安全ラッパ層（LabRobot）
 import asyncio
 import logging
 import math
+import threading
 import time
 from typing import Optional, List, Dict, Any
 
@@ -34,6 +35,12 @@ class LabRobot:
     必要なデバイスのみを選択的に初期化し、
     安全な操作インターフェースを提供します。
     """
+
+    # ピペット容量の既定値（MockLabRobot も同じ値を使う）
+    DEFAULT_MAX_PIPETTE_VOLUME = 10.0  # mL
+    DEFAULT_MIN_PIPETTE_VOLUME = 0.5   # mL
+    # スライダー最大位置の既定値（mm）
+    DEFAULT_SLIDER_MAX_POSITION = 1000.0
 
     def __init__(self,
                  use_dobot: bool = False,
@@ -78,13 +85,28 @@ class LabRobot:
         self.device_configs = device_configs
 
         # 実験設定
-        self.max_pipette_volume = 10.0  # mL（ピペットの最大容量）
-        self.min_pipette_volume = 0.5  # mL（ピペットの最小操作量）
+        self.max_pipette_volume = self.DEFAULT_MAX_PIPETTE_VOLUME  # mL（ピペットの最大容量）
+        self.min_pipette_volume = self.DEFAULT_MIN_PIPETTE_VOLUME  # mL（ピペットの最小操作量）
         self.picus2_max_retries = 5    # Picus2再接続最大試行回数
         self.picus2_retry_delays = [2, 3, 4, 5, 6]  # 各試行の待機時間（秒）
 
         # ピペットボリュームトラッキング（安全機能）
         self._current_pipette_volume = 0.0  # 現在ピペット内に保持している液体量（mL）
+        # 吸引／分注が中断・失敗すると実際の保持量は分からない。True の間は
+        # aspirate / dispense を拒否する（blow_out か reset_pipette_volume で解除）
+        self._pipette_volume_unknown = False
+        self._pipette_busy = False  # ピペット操作の実行中（緊急停止時の保持量判定用）
+
+        # 姿勢トラッキング: 移動が中断・失敗した後はアームの位置が分からない。
+        # True の間は次の移動の前にアームから位置を読み直し、静止を確認する
+        self._pose_unknown = False
+        self._estop_generation = 0  # emergency_stop() のたびに増える（移動中の停止検出用）
+        self.pose_settle_reads = device_configs.get('pose_settle_reads', 10)
+        self.pose_settle_interval = device_configs.get('pose_settle_interval', 0.2)
+        self.pose_settle_tolerance = device_configs.get('pose_settle_tolerance', 0.5)
+        # 中断時に force_stop() を送った後、ドライバ呼び出し（ワーカースレッド）の
+        # 終了を待つ上限（秒）
+        self.stop_wait_timeout = device_configs.get('stop_wait_timeout', 10.0)
 
         # 位置設定（X, Y, Z, Joint1）
         # 注意: 初期値はNone。set_current_position_as_home()で設定してください
@@ -109,7 +131,7 @@ class LabRobot:
         self.wait_after_conveyer = device_configs.get('wait_after_conveyer', 1.0)
 
         # スライダー設定
-        self.slider_max_position = device_configs.get('slider_max_position', 1000.0)
+        self.slider_max_position = device_configs.get('slider_max_position', self.DEFAULT_SLIDER_MAX_POSITION)
 
         # 初期化フラグ
         self._initialized = False
@@ -280,6 +302,115 @@ class LabRobot:
             return False
 
     # ========================================
+    # ブロッキングなドライバ呼び出しの実行（中断対応）
+    # ========================================
+
+    def _force_stop_dobot(self) -> bool:
+        """Dobot の force_stop() をベストエフォートで送る（例外を送出しない）"""
+        if self.dobot is None:
+            return False
+        try:
+            return bool(self.dobot.force_stop())
+        except Exception as e:
+            logger.error(f"Dobot 強制停止エラー: {e}")
+            return False
+
+    async def _run_blocking(self, func, *args, moves_arm: bool = True):
+        """ブロッキングなドライバ呼び出し（pydobot の wait=True など）をワーカースレッドで実行する
+
+        イベントループのスレッドで直接呼ぶと、Ctrl+C / キャンセルは移動が
+        終わるまで効かない。ここでは呼び出しを daemon スレッドで実行して待ち、
+        待機中にキャンセル（CancelledError / KeyboardInterrupt）されたら
+        待機側から ``dobot.force_stop()`` を送ってアームをその場で止め、
+        ワーカーの終了を（最大 stop_wait_timeout 秒）待ってから再送出する。
+        daemon スレッドを使うのは、戻らない呼び出し（コンベアの sleep など）が
+        asyncio.run の終了処理やプロセス終了を塞がないようにするため。
+
+        移動（moves_arm=True）が中断・失敗した場合、姿勢は不明として扱い、
+        次の移動の前にアームから読み直す（_read_pose）。
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        # 待たずに終わった場合も「Future exception was never retrieved」を出さない
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+        def _settle(result, error):
+            if not fut.done():
+                if error is not None:
+                    fut.set_exception(error)
+                else:
+                    fut.set_result(result)
+
+        def _worker():
+            try:
+                result, error = func(*args), None
+            except BaseException as e:  # noqa: BLE001 - 待機側へそのまま渡す
+                result, error = None, e
+            try:
+                loop.call_soon_threadsafe(_settle, result, error)
+            except RuntimeError:
+                pass  # イベントループが既に閉じている
+
+        name = getattr(func, "__name__", "driver")
+        estop_before = self._estop_generation
+        if moves_arm:
+            self._pose_unknown = True
+        threading.Thread(target=_worker, name=f"LabRobot-{name}", daemon=True).start()
+        try:
+            result = await asyncio.shield(fut)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.warning(f"Dobot: {name} の実行中に中断されました。強制停止します...")
+            self._force_stop_dobot()
+            await self._wait_worker(fut, name)
+            raise
+        if self._estop_generation != estop_before:
+            # 別スレッド（GUI の Stop）から緊急停止された: ドライバが正常に戻っても
+            # 移動は完了していない。姿勢は不明のまま、次の手順へ進ませない
+            raise RuntimeError(f"Dobot: {name} の実行中に緊急停止されました")
+        if moves_arm:
+            self._pose_unknown = False
+        return result
+
+    async def _wait_worker(self, fut, name):
+        """force_stop 後、ワーカースレッドのドライバ呼び出しの終了を待つ"""
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), self.stop_wait_timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Dobot: 強制停止後 {self.stop_wait_timeout:.0f} 秒待っても {name} が"
+                "戻りません。ワーカースレッドを残して中断を続行します"
+            )
+        except Exception as e:
+            logger.info(f"Dobot: 中断された {name} は例外で終了しました: {e}")
+
+    async def _read_pose(self):
+        """現在位置を取得する。前回の移動が中断・失敗していれば静止を確認して読み直す
+
+        Raises:
+            RuntimeError: 位置が安定しない（アームがまだ動いている）場合
+        """
+        if not self._pose_unknown:
+            return self.dobot.get_current_position()
+        logger.warning("前回の移動が中断または失敗したため、アームの現在位置を読み直します...")
+        prev = self.dobot.get_current_position()
+        tol = self.pose_settle_tolerance
+        for _ in range(max(1, int(self.pose_settle_reads))):
+            await asyncio.sleep(self.pose_settle_interval)
+            cur = self.dobot.get_current_position()
+            idx = [0, 1, 2] + ([4] if len(cur) > 4 and len(prev) > 4 else [])
+            if all(abs(cur[i] - prev[i]) <= tol for i in idx):
+                self._pose_unknown = False
+                logger.info(
+                    f"Dobot: 現在位置を再取得しました X={cur[0]:.1f}, Y={cur[1]:.1f}, Z={cur[2]:.1f}"
+                )
+                return cur
+            prev = cur
+        raise RuntimeError(
+            "アームの位置が安定しません（まだ動いている可能性があります）。"
+            "移動を中止しました"
+        )
+
+    # ========================================
     # 高レベル操作メソッド（L2層から呼ばれる）
     # ========================================
 
@@ -302,10 +433,12 @@ class LabRobot:
             self.workspace_validator.validate_joint1(angle)
 
         try:
+            if self._pose_unknown:
+                await self._read_pose()
             logger.info(f"Dobot: {angle}度に回転中...")
 
-            # PyDobotControllerのmove_angleを使用
-            self.dobot.move_angle(angle)
+            # PyDobotControllerのmove_angleを使用（ワーカースレッドで実行）
+            await self._run_blocking(self.dobot.move_angle, angle)
 
             await asyncio.sleep(self.wait_after_angle_move)
             logger.info(f"✓ Dobot: {angle}度回転完了")
@@ -346,7 +479,7 @@ class LabRobot:
 
         try:
             # 現在のジョイント角度を取得
-            current_pose = self.dobot.get_current_position()
+            current_pose = await self._read_pose()
             current_angle = current_pose[4]  # J1角度（ベース回転）
             target_angle = current_angle + delta_angle
 
@@ -356,8 +489,8 @@ class LabRobot:
 
             logger.info(f"Dobot: 現在{current_angle:.1f}°から{delta_angle:+.1f}°回転（目標: {target_angle:.1f}°, 速度: {speed or 'default'}）...")
 
-            # PyDobotControllerのmove_angleを使用
-            self.dobot.move_angle(target_angle)
+            # PyDobotControllerのmove_angleを使用（ワーカースレッドで実行）
+            await self._run_blocking(self.dobot.move_angle, target_angle)
 
             await asyncio.sleep(self.wait_after_angle_move)
             logger.info(f"✓ Dobot: {delta_angle:+.1f}°回転完了（現在: {target_angle:.1f}°）")
@@ -373,7 +506,10 @@ class LabRobot:
         finally:
             # プリセットを元に戻す
             if original_preset and self.dobot:
-                self.dobot.set_speed_preset(original_preset)
+                try:
+                    self.dobot.set_speed_preset(original_preset)
+                except Exception as e:  # 元の例外（中断を含む）を隠さない
+                    logger.error(f"速度プリセットを元に戻せませんでした: {e}")
 
     async def move_z(self, distance: float):
         """
@@ -391,7 +527,7 @@ class LabRobot:
 
         try:
             # 現在位置を取得
-            current_pose = self.dobot.get_current_position()
+            current_pose = await self._read_pose()
 
             # 可動域チェック
             if self.workspace_validator:
@@ -400,8 +536,8 @@ class LabRobot:
             direction = "上昇" if distance > 0 else "下降"
             logger.info(f"Dobot: Z軸 {abs(distance):.1f}mm {direction}中...")
 
-            # PyDobotControllerのmove_Zを使用
-            self.dobot.move_Z(distance)
+            # PyDobotControllerのmove_Zを使用（ワーカースレッドで実行）
+            await self._run_blocking(self.dobot.move_Z, distance)
 
             await asyncio.sleep(self.wait_after_z_move)
             logger.info(f"✓ Dobot: Z軸移動完了")
@@ -434,10 +570,12 @@ class LabRobot:
             self.workspace_validator.validate_xyz(x, y, z)
 
         try:
+            if self._pose_unknown:
+                await self._read_pose()
             logger.info(f"Dobot: XYZ({x:.1f}, {y:.1f}, {z:.1f})へ移動中...")
 
-            # PyDobotControllerのmove_XYZ_absを使用
-            self.dobot.move_XYZ_abs(x, y, z)
+            # PyDobotControllerのmove_XYZ_absを使用（ワーカースレッドで実行）
+            await self._run_blocking(self.dobot.move_XYZ_abs, x, y, z)
 
             await asyncio.sleep(self.wait_after_xy_move)
             logger.info(f"✓ Dobot: XYZ移動完了")
@@ -470,7 +608,7 @@ class LabRobot:
             raise RuntimeError("Dobotが初期化されていません")
 
         try:
-            current_pose = self.dobot.get_current_position()
+            current_pose = await self._read_pose()
             x, y = current_pose[0], current_pose[1]
             r = math.sqrt(x**2 + y**2)
 
@@ -491,7 +629,7 @@ class LabRobot:
             direction = "外向き" if distance > 0 else "内向き"
             logger.info(f"Dobot: 半径方向 {abs(distance):.1f}mm {direction}移動中...")
 
-            self.dobot.move_XYZ_abs(new_x, new_y, current_pose[2])
+            await self._run_blocking(self.dobot.move_XYZ_abs, new_x, new_y, current_pose[2])
 
             await asyncio.sleep(self.wait_after_xy_move)
             logger.info(f"✓ Dobot: 半径方向移動完了（r: {r:.1f} -> {r + distance:.1f}mm）")
@@ -530,7 +668,7 @@ class LabRobot:
         try:
             logger.info(f"Dobot: スライダーを位置 {position:.1f} に移動中...")
 
-            self.dobot.move_slider(position)
+            await self._run_blocking(self.dobot.move_slider, position)
 
             await asyncio.sleep(self.wait_after_slider_move)
             logger.info(f"✓ Dobot: スライダー移動完了（位置: {position:.1f}）")
@@ -569,7 +707,10 @@ class LabRobot:
                 f"（インデックス: {index}, 速度: {speed}, 時間: {duration}秒）..."
             )
 
-            self.dobot.move_conveyer(index, speed, duration)
+            # ドライバは動作時間ぶん sleep するため、ワーカースレッドで実行する。
+            # 中断時は force_stop() がコンベア（EMotor）も即時停止する
+            await self._run_blocking(self.dobot.move_conveyer, index, speed, duration,
+                                     moves_arm=False)
 
             await asyncio.sleep(self.wait_after_conveyer)
             logger.info(f"✓ Dobot: コンベアベルト動作完了")
@@ -603,6 +744,7 @@ class LabRobot:
         # デバイス初期化チェック
         if not self.use_picus2 or self.picus2 is None:
             raise RuntimeError("Picus2が初期化されていません")
+        self._require_known_pipette_volume()
 
         # パラメータ検証
         if volume < self.min_pipette_volume:
@@ -620,6 +762,7 @@ class LabRobot:
                 f"最大容量 {self.max_pipette_volume}mL"
             )
 
+        self._pipette_busy = True
         try:
             logger.info(
                 f"電動ピペット {volume:.2f}mL 吸引中（速度: {speed}）... "
@@ -638,9 +781,12 @@ class LabRobot:
             logger.info(f"✓ {volume:.2f}mL 吸引完了（保持量: {self._current_pipette_volume:.2f}mL）")
             return {"nominal_time_s": nominal_time}
 
-        except Exception as e:
-            logger.error(f"吸引エラー: {e}")
+        except BaseException as e:
+            # 途中で中断・失敗した: 実際に吸引された量は分からない
+            self._mark_pipette_volume_unknown(f"吸引が中断または失敗しました: {e!r}")
             raise
+        finally:
+            self._pipette_busy = False
 
     async def dispense(self, volume: float, speed: int = 5):
         """
@@ -657,6 +803,7 @@ class LabRobot:
         # デバイス初期化チェック
         if not self.use_picus2 or self.picus2 is None:
             raise RuntimeError("Picus2が初期化されていません")
+        self._require_known_pipette_volume()
 
         # パラメータ検証
         if volume < self.min_pipette_volume:
@@ -677,6 +824,7 @@ class LabRobot:
 
         new_volume = self._current_pipette_volume - volume
 
+        self._pipette_busy = True
         try:
             logger.info(
                 f"電動ピペット {volume:.2f}mL 分注中（速度: {speed}）... "
@@ -695,9 +843,12 @@ class LabRobot:
             logger.info(f"✓ {volume:.2f}mL 分注完了（残量: {self._current_pipette_volume:.2f}mL）")
             return {"nominal_time_s": nominal_time}
 
-        except Exception as e:
-            logger.error(f"分注エラー: {e}")
+        except BaseException as e:
+            # 途中で中断・失敗した: 実際に分注された量は分からない
+            self._mark_pipette_volume_unknown(f"分注が中断または失敗しました: {e!r}")
             raise
+        finally:
+            self._pipette_busy = False
 
     async def blow_out(self, go_home: bool = True, speed: int = 1, delay_ms: int = 3000):
         """
@@ -728,6 +879,8 @@ class LabRobot:
 
         previous_volume = self._current_pipette_volume
 
+        # 保持量が不明でも blow_out は許可する（全量排出して 0 mL に戻す復帰手段）
+        self._pipette_busy = True
         try:
             logger.info(
                 f"電動ピペット ブローアウト中（速度: {speed}, 待機: {delay_ms}ms）... "
@@ -745,11 +898,14 @@ class LabRobot:
 
             # ボリュームトラッキングをリセット
             self._current_pipette_volume = 0.0
+            self._pipette_volume_unknown = False
             logger.info(f"✓ ブローアウト完了（{previous_volume:.2f}mL 排出、保持量: 0.00mL）")
 
-        except Exception as e:
-            logger.error(f"ブローアウトエラー: {e}")
+        except BaseException as e:
+            self._mark_pipette_volume_unknown(f"ブローアウトが中断または失敗しました: {e!r}")
             raise
+        finally:
+            self._pipette_busy = False
 
     # ===== ピペットボリューム管理 =====
 
@@ -762,6 +918,26 @@ class LabRobot:
             float: 現在ピペット内に保持している液体量（mL）
         """
         return self._current_pipette_volume
+
+    @property
+    def pipette_volume_known(self) -> bool:
+        """保持量が確定しているか（吸引／分注の中断・失敗後は False）"""
+        return not self._pipette_volume_unknown
+
+    def _mark_pipette_volume_unknown(self, reason: str):
+        self._pipette_volume_unknown = True
+        logger.error(
+            f"{reason}。ピペット保持量は不明になりました（最後の確定値: "
+            f"{self._current_pipette_volume:.2f}mL）。blow_out() で排出するか "
+            "reset_pipette_volume() でリセットするまで吸引・分注を拒否します"
+        )
+
+    def _require_known_pipette_volume(self):
+        if self._pipette_volume_unknown:
+            raise RuntimeError(
+                "ピペット保持量が不明です（前回の吸引／分注が中断または失敗）。"
+                "blow_out() で排出するか reset_pipette_volume() でリセットしてください"
+            )
 
     @property
     def pipette_remaining_capacity(self) -> float:
@@ -794,6 +970,7 @@ class LabRobot:
 
         old_volume = self._current_pipette_volume
         self._current_pipette_volume = volume
+        self._pipette_volume_unknown = False
         logger.info(f"ピペットボリュームをリセット: {old_volume:.2f}mL → {volume:.2f}mL")
 
     async def _recover_home(self):
@@ -802,7 +979,13 @@ class LabRobot:
         go_home() 自体の失敗（可動域違反による拒否を含む）はログに残して握りつぶし、
         呼び出し側で元の例外を再送出させる。中断（CancelledError /
         KeyboardInterrupt）はそのまま伝播させる。
+
+        緊急停止（emergency_stop）の後は自動のホーム復帰を行わない
+        （止めたアームを未確認のまま動かさない）。
         """
+        if self._estop_generation:
+            logger.error("緊急停止後のため、エラー後の自動ホーム復帰は行いません")
+            return
         try:
             await self.go_home()
         except Exception as e:
@@ -850,8 +1033,8 @@ class LabRobot:
         try:
             logger.info("Dobot: ホームポジションへ復帰中...")
 
-            # 現在位置を取得
-            current_pose = self.dobot.get_current_position()
+            # 現在位置を取得（前回の移動が中断・失敗していれば静止を確認して読み直す）
+            current_pose = await self._read_pose()
 
             # 全区間を事前検証（可動域外なら何も動かさずに送出）
             try:
@@ -864,21 +1047,22 @@ class LabRobot:
             # 現在Zがホームより高い場合は下降させない（障害物回避のため、ステップ3で調整）
             if z_diff is not None:
                 logger.info(f"Z軸をホーム位置 {self.home_position[2]:.1f} まで上昇中...")
-                self.dobot.move_Z(z_diff)
+                await self._run_blocking(self.dobot.move_Z, z_diff)
                 await asyncio.sleep(self.wait_after_z_move)
 
             # ステップ2: Z軸が安全な位置になってからJoint1角度を回転
             if len(self.home_position) >= 4:
                 logger.info(f"Joint1角度をホーム角度 {self.home_position[3]:.1f}° に回転中...")
-                self.dobot.move_angle(self.home_position[3])
+                await self._run_blocking(self.dobot.move_angle, self.home_position[3])
                 await asyncio.sleep(self.wait_after_angle_move)
 
             # ステップ3: 最後にXY座標に移動
             logger.info(f"XY座標 ({self.home_position[0]:.1f}, {self.home_position[1]:.1f}) に移動中...")
-            self.dobot.move_XYZ_abs(
+            await self._run_blocking(
+                self.dobot.move_XYZ_abs,
                 self.home_position[0],
                 self.home_position[1],
-                self.home_position[2]
+                self.home_position[2],
             )
             await asyncio.sleep(self.wait_after_xy_move)
 
@@ -1002,13 +1186,21 @@ class LabRobot:
 
         # Dobot: キュー強制停止＋残キュー破棄＋コンベア停止
         if self.dobot is not None:
-            try:
-                if self.dobot.force_stop():
-                    logger.warning("✓ Dobot: コマンドキューを強制停止しました")
-                else:
-                    logger.error("Dobot の強制停止に失敗しました（未接続または通信エラー）")
-            except Exception as e:
-                logger.error(f"Dobot 強制停止エラー: {e}")
+            # 停止した位置は分からない: 次の移動の前に読み直させる
+            self._estop_generation += 1
+            self._pose_unknown = True
+            if self._force_stop_dobot():
+                logger.warning("✓ Dobot: コマンドキューを強制停止しました")
+            else:
+                logger.error("Dobot の強制停止に失敗しました（未接続または通信エラー）")
+
+        # Picus2: ドライバに停止コマンドは無い（実行中のストロークは本体側で完了する）。
+        # 操作中だった場合は保持量を不明として扱う
+        if self._pipette_busy:
+            self._mark_pipette_volume_unknown("ピペット操作中に緊急停止しました")
+            logger.warning(
+                "Picus2 には停止コマンドが無いため、実行中の吸引／分注は本体側で最後まで動作します"
+            )
 
         # IKA: 撹拌・温度制御を停止（加熱の継続は危険）
         if self.ika is not None:
@@ -1029,6 +1221,17 @@ class LabRobot:
         """
         logger.info("=== LabRobot デバイス切断開始 ===")
         interrupted = None
+
+        # IKA: ポートを閉じる前に撹拌・加熱を止める（閉じた後は制御できなくなる）
+        if self.ika is not None and hasattr(self.ika, "stop_stirring"):
+            try:
+                self.ika.stop_stirring()
+                logger.info("✓ IKA: 撹拌・温度制御を停止しました")
+            except Exception as e:
+                logger.error(f"IKA 停止エラー（切断は続行します）: {e}")
+            except BaseException as e:  # 中断されても切断は続ける
+                logger.error(f"IKA 停止中に中断されました: {e!r}")
+                interrupted = e
 
         for name, device, is_async in (
             ("Dobot", self.dobot, False),

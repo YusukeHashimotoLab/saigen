@@ -23,14 +23,25 @@
 """
 import asyncio
 import logging
+import os
 import threading
 from typing import Awaitable, Callable, Dict, Optional
 
 from src import config as lab_config
 from src.devices.safety.lab_robot import LabRobot
-from src.devices.safety.mock_robot import MockLabRobot, MockSharedDevices
+from src.devices.safety.mock_robot import MockLabRobot, MockSharedDevices, parse_start_pose
 from src.devices.safety.shared_devices import SharedDevices
 from src.devices.safety.validators import ValidationError, default_workspace_validator
+
+
+class SafetyAbort(RuntimeError):
+    """A run must stop immediately, without any recovery motion.
+
+    Raised by safety gates (e.g. the GUI's sensor interlock in src/gui/runner.py)
+    when continuing is unsafe. ExperimentSession.run treats it like a validation
+    error: hardware is stopped in place (emergency stop) and go_home_all() is NOT
+    attempted, because a "go home" move may itself be the unsafe action.
+    """
 
 logger = logging.getLogger(__name__)
 
@@ -47,18 +58,50 @@ def default_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     )
 
 
+def mock_start_pose(robot_id=None, shared_config: Optional[dict] = None):
+    """Mock の開始姿勢 (x, y, z, r) を返す（未設定なら None = 既定の姿勢）
+
+    実機はアームの「現在位置」をホームとし、相対移動をそこから検証する。
+    Mock を同じ姿勢から始めるための設定で、優先順位は
+    環境変数 ``MOCK_START_POSE`` → config.yaml の ``shared_devices.mock_start_pose``。
+    値は "x,y,z,r" 文字列または 4 要素のリスト。config.yaml では
+    robot_id をキーにした辞書でロボットごとに指定することもできる。
+
+    Raises:
+        ValueError: 値を解釈できない場合（黙って既定の姿勢に戻さない）
+    """
+    env = os.environ.get("MOCK_START_POSE", "").strip()
+    if env:
+        return parse_start_pose(env)
+    if shared_config is None:
+        try:
+            shared_config = lab_config.get_shared_devices()
+        except Exception as e:  # noqa: BLE001 - 設定が読めなければ既定の姿勢
+            logger.warning(f"mock_start_pose の設定を読めませんでした: {e}")
+            return None
+    value = (shared_config or {}).get("mock_start_pose")
+    if isinstance(value, dict):
+        value = value.get(robot_id, value.get(str(robot_id)))
+    return parse_start_pose(value)
+
+
 def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     """MockLabRobot を生成するファクトリ（実機なしでの動作確認用）
 
     可動域バリデータは実機と同じものを渡す。Mock でも可動域違反が
     実行前に検出されるため、フロー JSON の安全確認に使える。
+    開始姿勢は mock_start_pose()（MOCK_START_POSE / config.yaml）から取る。
     """
+    start_pose = mock_start_pose(robot_id)
+    if start_pose is not None:
+        logger.info(f"[MOCK] Robot {robot_id} の開始姿勢: {start_pose}")
     return MockLabRobot(
         use_dobot=True,
         use_picus2=use_picus2,
         dobot_port=ports.get("dobot_port", ""),
         picus2_address=ports.get("picus2_address", ""),
         workspace_validator=workspace_validator,
+        start_pose=start_pose,
     )
 
 
@@ -236,8 +279,14 @@ class ExperimentSession:
 
         中断（CancelledError / KeyboardInterrupt）は捕捉せずに伝播させる。
         呼び出し側（run）が緊急停止してから後始末する。
+        緊急停止済みのロボット（GUI の Stop など）は動かさない。
         """
         for rid, robot in list(self.robots.items()):
+            with self._estop_lock:
+                stopped = rid in self._estopped_ids
+            if stopped:
+                logger.warning(f"Robot {rid} は緊急停止済みのためホーム復帰しません")
+                continue
             try:
                 logger.info(f"Robot {rid} をホームに戻しています...")
                 await robot.go_home()
@@ -280,6 +329,8 @@ class ExperimentSession:
           （ホーム復帰の追加動作はさせず、その場で止める）
         - 可動域違反（ValidationError）: アームは動いていないので
           ホーム復帰はせず、そのまま再送出
+        - 安全ゲートによる停止（SafetyAbort）: 全ロボットを緊急停止し、
+          ホーム復帰はせずに status="aborted" で再送出
         - その他の例外: 全ロボットをホームに戻して再送出。ホーム復帰中に
           中断（Ctrl+C / キャンセル）された場合は緊急停止してから再送出
         - いずれの場合もクリーンアップ（切断）は必ず実行する
@@ -300,6 +351,12 @@ class ExperimentSession:
         except Exception as e:
             logger.error(f"実行エラー: {e}")
             self.status, self.error = "failed", str(e)
+            if isinstance(e, SafetyAbort):
+                # 続行が危険: その場で止める。ホーム復帰の動作自体が危険な場合がある
+                logger.error("安全ゲートにより中止しました。緊急停止します（ホーム復帰は行いません）")
+                self.status = "aborted"
+                self.emergency_stop_all()
+                raise
             if isinstance(e, ValidationError):
                 # 移動は検証で拒否され、コマンドは送信されていない。
                 # 未検証の復帰動作をさせる理由がないのでホーム復帰しない

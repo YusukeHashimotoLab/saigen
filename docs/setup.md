@@ -141,6 +141,31 @@ same `logs/<date>/<flow name>_<timestamp>/` folder as a real one, so you can ins
 `run.log`, `measurements.csv`, `summary.md` and `metadata.json` before touching
 hardware.
 
+The mock enforces the same pipette limits as the real wrapper (10 mL capacity,
+0.5 mL minimum, no dispensing more than is held, `blow_out` empties the tip), so a
+flow that dispenses before it aspirates fails in the mock exactly as it would on
+the bench.
+
+**Set the mock start pose to the pose you will start the real run from.** A real
+run takes the arm's *current* pose as home and validates every relative move
+(`move_z`, `move_radial`, `rotate_relative`) from there. The mock cannot know where
+your arm is, so it starts from a fixed pose, X=250, Y=0, Z=150, R=0 by default, and
+validates relative moves from that pose. If the real start pose is different, a
+mock run can pass a move that the real run rejects, or the other way round.
+Read the pose off the arm (DobotStudio, or the start of a previous `run.log`) and
+set it either in `config.yaml`:
+
+```yaml
+shared_devices:
+  mock_start_pose: "200,0,50,0"      # x, y, z, r (mm, mm, mm, degrees)
+  # or per robot:
+  # mock_start_pose: {1: "200,0,50,0", 2: "0,200,50,90"}
+```
+
+or for one run with the environment variable `MOCK_START_POSE=200,0,50,0` (it takes
+precedence over `config.yaml`). Joint 1 is derived from X and Y, as on the arm. An
+unparsable value stops the mock run instead of silently falling back to the default.
+
 Run the test suite too — it needs no hardware:
 
 ```bash

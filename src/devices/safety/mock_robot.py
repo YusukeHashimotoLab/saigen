@@ -1,17 +1,62 @@
 import asyncio
 import logging
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
+from src.devices.safety.lab_robot import LabRobot
 from src.devices.safety.validators import ValidationError, WorkspaceValidator
 
 logger = logging.getLogger(__name__)
 
+#: MockLabRobot の既定の開始姿勢 (X, Y, Z, R)
+DEFAULT_MOCK_START_POSE = (250.0, 0.0, 150.0, 0.0)
+
+
+def parse_start_pose(value) -> Optional[tuple]:
+    """"x,y,z,r" 文字列または 4 要素のリストを (x, y, z, r) に変換する
+
+    None / 空文字は None を返す（既定の姿勢を使う）。
+
+    Raises:
+        ValueError: 4 つの数値として解釈できない場合
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parts = [p for p in text.replace(";", ",").split(",")]
+    else:
+        parts = list(value)
+    try:
+        pose = tuple(float(p) for p in parts)
+    except (TypeError, ValueError):
+        raise ValueError(f"mock_start_pose は 'x,y,z,r' の 4 つの数値で指定してください（指定値: {value!r}）")
+    if len(pose) != 4 or not all(math.isfinite(v) for v in pose):
+        raise ValueError(f"mock_start_pose は 'x,y,z,r' の 4 つの数値で指定してください（指定値: {value!r}）")
+    return pose
+
+
 class MockLabRobot:
     """
-    GUIテスト用モッククラス
+    GUIテスト・--mock 実行用モッククラス
     LabRobotと同じメソッドを持つが、実機には接続しない。
+
+    --mock のクリーンな実行が実機の実行を予測できるよう、LabRobot と同じ
+    制約を同じ例外型で再現する:
+
+    - ピペット保持量のトラッキング（最大容量・最小操作量・保持量を超える分注の拒否、
+      blow_out で 0 に戻る、中断後は保持量不明として吸引・分注を拒否）
+    - 一貫した模擬姿勢: 回転は半径と Z を保ったまま X/Y も動かし、XYZ 移動は
+      Joint1 (= atan2(Y, X)) も更新する。半径方向移動は現在の半径に沿って動き、
+      基部に近すぎる場合はバリデータの有無にかかわらず ValueError を送出する
+    - 開始姿勢 ``start_pose``: 実機は起動時のアームの現在位置をホームとし、
+      相対移動をそこから検証する。Mock でも同じ姿勢から始めると検証結果が一致する
+
+    内部の姿勢 ``_pos`` は [X, Y, Z, Joint1]（LabRobot.home_position と同じ並び）。
     """
+
     def __init__(
         self,
         use_dobot: bool = False,
@@ -19,13 +64,28 @@ class MockLabRobot:
         use_scale: bool = False,
         use_camera: bool = False,
         workspace_validator: Optional[WorkspaceValidator] = None,
+        start_pose: Optional[Sequence[float]] = None,
         **device_configs
     ):
         self.device_configs = device_configs
-        # [X, Y, Z, R]
-        self._pos = [250.0, 0.0, 150.0, 0.0]
+        pose = parse_start_pose(start_pose) or DEFAULT_MOCK_START_POSE
+        x, y, z, r = pose
+        # Dobot Magician の Joint1 はアームの向きそのもの (atan2(Y, X))。
+        # R は J1 + J4（回転サーボ無しなら J1 と同じ）
+        if math.hypot(x, y) >= 1.0:
+            j1 = math.degrees(math.atan2(y, x))
+            if abs(j1 - r) > 1.0:
+                logger.warning(
+                    f"[MOCK] start_pose の R={r:.1f}° が X/Y から決まる Joint1={j1:.1f}° と"
+                    "一致しません。Joint1 の検証には X/Y から求めた値を使います"
+                )
+        else:
+            j1 = r
+        # [X, Y, Z, Joint1]
+        self._pos = [x, y, z, j1]
+        self._r = r
         self._slider_pos = 0.0
-        self.home_position = [250.0, 0.0, 150.0, 0.0]
+        self.home_position = list(self._pos)
 
         # 可動域バリデータ（Noneの場合はバリデーションなし）
         self.workspace_validator = workspace_validator
@@ -36,10 +96,34 @@ class MockLabRobot:
         self.use_scale = use_scale
         self.use_camera = use_camera
 
+        # ピペット（LabRobot と同じ制約）
+        self.max_pipette_volume = LabRobot.DEFAULT_MAX_PIPETTE_VOLUME
+        self.min_pipette_volume = LabRobot.DEFAULT_MIN_PIPETTE_VOLUME
+        self._current_pipette_volume = 0.0
+        self._pipette_volume_unknown = False
+
+        self.slider_max_position = device_configs.get(
+            'slider_max_position', LabRobot.DEFAULT_SLIDER_MAX_POSITION)
+
     async def initialize(self) -> bool:
         logger.info("=== [MOCK] 仮想デバイス初期化 (成功) ===")
         await asyncio.sleep(0.5)
         return True
+
+    # ===== 模擬姿勢 =====
+
+    def get_current_position(self):
+        """[X, Y, Z, R, J1, J2, J3, J4]（LabRobot / PyDobot と同じ並び。J2-J4 は 0）"""
+        x, y, z, j1 = self._pos
+        return [x, y, z, j1, j1, 0.0, 0.0, 0.0]
+
+    def _set_joint1(self, angle: float):
+        """半径と Z を保ったまま Joint1 を回す（MOVJ_ANGLE と同じく J2/J3 は不変）"""
+        radius = math.hypot(self._pos[0], self._pos[1])
+        rad = math.radians(angle)
+        self._pos[0] = radius * math.cos(rad)
+        self._pos[1] = radius * math.sin(rad)
+        self._pos[3] = angle
 
     async def rotate(self, angle: float):
         """絶対角度で回転"""
@@ -49,7 +133,7 @@ class MockLabRobot:
 
         logger.info(f"[MOCK Dobot] 絶対回転: {self._pos[3]:.1f}° -> {angle:.1f}°")
         await asyncio.sleep(1.0)
-        self._pos[3] = angle
+        self._set_joint1(angle)
         logger.info(f"✓ [MOCK Dobot] 絶対回転完了")
 
     async def rotate_relative(self, delta_angle: float, speed: str = None):
@@ -64,7 +148,7 @@ class MockLabRobot:
         speed_info = f", 速度: {speed}" if speed else ""
         logger.info(f"[MOCK Dobot] 相対回転: {current:.1f}°から{delta_angle:+.1f}°（目標: {target:.1f}°{speed_info}）")
         await asyncio.sleep(1.0)
-        self._pos[3] = target
+        self._set_joint1(target)
         logger.info(f"✓ [MOCK Dobot] 相対回転完了（現在: {target:.1f}°）")
 
     async def move_z(self, distance: float):
@@ -88,33 +172,54 @@ class MockLabRobot:
         logger.info(f"[MOCK Dobot] XYZ移動: ({x}, {y}, {z})")
         await asyncio.sleep(1.0)
         self._pos[0], self._pos[1], self._pos[2] = x, y, z
+        if math.hypot(x, y) >= 1.0:
+            self._pos[3] = math.degrees(math.atan2(y, x))
         logger.info(f"✓ [MOCK Dobot] XYZ移動完了")
 
     async def move_radial(self, distance: float):
-        """[MOCK] 半径方向移動のシミュレーション"""
+        """[MOCK] 半径方向移動のシミュレーション（LabRobot.move_radial と同じ検証）"""
         x, y = self._pos[0], self._pos[1]
         r = math.sqrt(x**2 + y**2)
 
-        if self.workspace_validator and r >= 1.0:
-            scale = (r + distance) / r
-            new_x, new_y = x * scale, y * scale
+        if r < 1.0:
+            raise ValueError(
+                f"現在の半径距離が小さすぎます（r={r:.1f}mm）。"
+                "基部直上では半径方向が定義できません"
+            )
+
+        scale = (r + distance) / r
+        new_x, new_y = x * scale, y * scale
+        if self.workspace_validator:
             self.workspace_validator.validate_xyz(new_x, new_y, self._pos[2])
-            self._pos[0], self._pos[1] = new_x, new_y
 
         direction = "外向き" if distance > 0 else "内向き"
         logger.info(f"[MOCK Dobot] 半径方向移動: {abs(distance):.1f}mm {direction}（r: {r:.1f} -> {r + distance:.1f}mm）")
         await asyncio.sleep(0.5)
+        self._pos[0], self._pos[1] = new_x, new_y
         logger.info(f"✓ [MOCK Dobot] 半径方向移動完了")
 
     async def move_slider(self, position: float):
-        """[MOCK] スライダー移動のシミュレーション"""
+        """[MOCK] スライダー移動のシミュレーション（LabRobot と同じ範囲検証）"""
+        if position < 0:
+            raise ValueError(f"スライダー位置は0以上で指定してください（指定値: {position}）")
+        if position > self.slider_max_position:
+            raise ValueError(
+                f"スライダー位置が最大値を超えています"
+                f"（指定値: {position}, 最大: {self.slider_max_position}）"
+            )
         logger.info(f"[MOCK Dobot] スライダー移動: {self._slider_pos:.1f} -> {position:.1f}")
         await asyncio.sleep(1.0)
         self._slider_pos = position
         logger.info(f"✓ [MOCK Dobot] スライダー移動完了（位置: {position:.1f}）")
 
     async def move_conveyer(self, index: int, speed: float, duration: float):
-        """[MOCK] コンベアベルト動作のシミュレーション"""
+        """[MOCK] コンベアベルト動作のシミュレーション（LabRobot と同じ範囲検証）"""
+        if not 0 <= index <= 1:
+            raise ValueError(f"コンベアインデックスは0-1の範囲で指定してください（指定値: {index}）")
+        if speed <= 0 or speed > 200:
+            raise ValueError(f"コンベア速度は0より大きく200以下で指定してください（指定値: {speed}）")
+        if duration <= 0 or duration > 300:
+            raise ValueError(f"コンベア動作時間は0より大きく300秒以下で指定してください（指定値: {duration}）")
         logger.info(
             f"[MOCK Dobot] コンベアベルト動作"
             f"（インデックス: {index}, 速度: {speed}, 時間: {duration}秒）"
@@ -168,31 +273,91 @@ class MockLabRobot:
 
         return nominal_operation_time(volume, speed)
 
+    # 保持量トラッキングは LabRobot と同じ実装・同じメッセージを使う
+    pipette_volume = LabRobot.pipette_volume
+    pipette_volume_known = LabRobot.pipette_volume_known
+    pipette_remaining_capacity = LabRobot.pipette_remaining_capacity
+    reset_pipette_volume = LabRobot.reset_pipette_volume
+    _mark_pipette_volume_unknown = LabRobot._mark_pipette_volume_unknown
+    _require_known_pipette_volume = LabRobot._require_known_pipette_volume
+
+    def _check_pipette(self, volume: float, speed: int, label: str):
+        """LabRobot.aspirate / dispense と同じ順序・同じ例外型で検証する"""
+        if not self.use_picus2:
+            raise RuntimeError("Picus2が初期化されていません")
+        self._require_known_pipette_volume()
+        if volume < self.min_pipette_volume:
+            raise ValueError(f"{label}量が最小値未満です（指定: {volume}mL, 最小: {self.min_pipette_volume}mL）")
+        if not 1 <= speed <= 9:
+            raise ValueError(f"speedは1-9の範囲で指定してください（指定値: {speed}）")
+
     async def aspirate(self, volume: float, speed: int = 5):
-        """[MOCK] 液体吸引のシミュレーション"""
+        """[MOCK] 液体吸引のシミュレーション（LabRobot と同じ保持量制約）"""
+        self._check_pipette(volume, speed, "吸引")
+        new_volume = self._current_pipette_volume + volume
+        if new_volume > self.max_pipette_volume:
+            raise ValueError(
+                f"容量オーバー: 現在 {self._current_pipette_volume:.2f}mL + "
+                f"吸引 {volume:.2f}mL = {new_volume:.2f}mL > "
+                f"最大容量 {self.max_pipette_volume}mL"
+            )
         nominal_time = self._nominal_pipette_time(volume, speed)
-        logger.info(f"[MOCK] 吸引中: {volume:.2f}mL（速度: {speed}）")
+        logger.info(f"[MOCK] 吸引中: {volume:.2f}mL（速度: {speed}）"
+                    f" [現在: {self._current_pipette_volume:.2f}mL → {new_volume:.2f}mL]")
         logger.info(f"  nominal ≈{nominal_time:.2f} s for {volume:.1f} mL at speed {speed}")
-        await asyncio.sleep(0.5)
-        logger.info(f"✓ [MOCK] 吸引完了: {volume:.2f}mL")
+        try:
+            await asyncio.sleep(0.5)
+        except BaseException as e:
+            self._mark_pipette_volume_unknown(f"[MOCK] 吸引が中断されました: {e!r}")
+            raise
+        self._current_pipette_volume = new_volume
+        logger.info(f"✓ [MOCK] 吸引完了: {volume:.2f}mL（保持量: {new_volume:.2f}mL）")
         return {"nominal_time_s": nominal_time}
 
     async def dispense(self, volume: float, speed: int = 5):
-        """[MOCK] 液体分注のシミュレーション"""
+        """[MOCK] 液体分注のシミュレーション（LabRobot と同じ保持量制約）"""
+        self._check_pipette(volume, speed, "分注")
+        if self._current_pipette_volume <= 0:
+            logger.warning("警告: [MOCK] 吸引せずに分注しようとしています（保持量: 0mL）")
+        if volume > self._current_pipette_volume:
+            raise ValueError(
+                f"分注量が保持量を超えています: "
+                f"分注 {volume:.2f}mL > 保持量 {self._current_pipette_volume:.2f}mL"
+            )
+        new_volume = self._current_pipette_volume - volume
         nominal_time = self._nominal_pipette_time(volume, speed)
-        logger.info(f"[MOCK] 分注中: {volume:.2f}mL（速度: {speed}）")
+        logger.info(f"[MOCK] 分注中: {volume:.2f}mL（速度: {speed}）"
+                    f" [現在: {self._current_pipette_volume:.2f}mL → {new_volume:.2f}mL]")
         logger.info(f"  nominal ≈{nominal_time:.2f} s for {volume:.1f} mL at speed {speed}")
-        await asyncio.sleep(0.5)
-        logger.info(f"✓ [MOCK] 分注完了: {volume:.2f}mL")
+        try:
+            await asyncio.sleep(0.5)
+        except BaseException as e:
+            self._mark_pipette_volume_unknown(f"[MOCK] 分注が中断されました: {e!r}")
+            raise
+        self._current_pipette_volume = new_volume
+        logger.info(f"✓ [MOCK] 分注完了: {volume:.2f}mL（残量: {new_volume:.2f}mL）")
         return {"nominal_time_s": nominal_time}
 
     async def blow_out(self, go_home: bool = True, speed: int = 1, delay_ms: int = 3000):
-        """[MOCK] ブローアウトのシミュレーション"""
-        logger.info(f"[MOCK] ブローアウト中（速度: {speed}, 待機: {delay_ms}ms）")
-        await asyncio.sleep(0.5)
+        """[MOCK] ブローアウトのシミュレーション（保持量を 0 に戻す）"""
+        if not self.use_picus2:
+            raise RuntimeError("Picus2が初期化されていません")
+        if not 1 <= speed <= 9:
+            raise ValueError(f"speedは1-9の範囲で指定してください（指定値: {speed}）")
+        if delay_ms < 0:
+            raise ValueError(f"delay_msは0以上で指定してください（指定値: {delay_ms}）")
+        previous = self._current_pipette_volume
+        logger.info(f"[MOCK] ブローアウト中（速度: {speed}, 待機: {delay_ms}ms）[排出量: {previous:.2f}mL]")
+        try:
+            await asyncio.sleep(0.5)
+        except BaseException as e:
+            self._mark_pipette_volume_unknown(f"[MOCK] ブローアウトが中断されました: {e!r}")
+            raise
         if go_home:
             logger.info("[MOCK] ピストンをホームに戻す")
-        logger.info("✓ [MOCK] ブローアウト完了")
+        self._current_pipette_volume = 0.0
+        self._pipette_volume_unknown = False
+        logger.info("✓ [MOCK] ブローアウト完了（保持量: 0.00mL）")
 
     # ===== 電子天秤操作（BCE8221） =====
 

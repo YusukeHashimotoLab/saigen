@@ -32,7 +32,7 @@ caller; there are no hard-coded addresses.
 |---|---|---|
 | `lab_robot.py` | `LabRobot` | One robot = one arm + optionally one pipette (+ stirrer). Async API used by the executor: `move_xyz`, `move_z`, `move_radial`, `rotate`, `rotate_relative`, `go_home`, `aspirate`, `dispense`, `blow_out`, `move_slider`, `move_conveyer`. Tracks the current pose and the volume held in the tip. |
 | `shared_devices.py` | `SharedDevices` | Balance, camera and microscope, shared by all robots: `tare_scale`, `measure_weight`, `capture_and_save`, `capture_microscope`, `set_microscope_led`, `focus_microscope`. |
-| `mock_robot.py` | `MockLabRobot`, `MockSharedDevices` | Same interface as `LabRobot` / `SharedDevices` without hardware; used by `--mock` and the GUI's Mock mode. The mock enforces the same workspace limits and returns realistic weights, so mock runs produce the same records as real ones. |
+| `mock_robot.py` | `MockLabRobot`, `MockSharedDevices` | Same interface as `LabRobot` / `SharedDevices` without hardware; used by `--mock` and the GUI's Mock mode. The mock enforces the same workspace limits and the same pipette-volume limits (same exception types), keeps a coherent simulated pose (rotations move X/Y, XYZ moves update joint 1, radial moves follow the current radius) and returns realistic weights, so mock runs produce the same records as real ones. Its start pose is `start_pose=(x, y, z, r)`; the runners take it from `shared_devices.mock_start_pose` in `config.yaml` or `MOCK_START_POSE` (see `docs/setup.md`, section 5). |
 | `validators/` | `WorkspaceValidator` | XYZ box and joint-1 angle limits, checked before every move. The limits come from the `workspace` section of `config.yaml` in the repository root (`default_workspace_validator()`); edit that file to match your fixtures. |
 
 Construction:
@@ -64,14 +64,30 @@ Safety behaviour built into the wrapper:
 - `initialize()` raises if any device fails to come up (and disconnects whatever did
   connect) rather than returning a status that a caller could ignore and then drive a
   disconnected arm.
+- Every blocking driver call (pydobot moves with `wait=True`, the conveyor's timed
+  run) runs in a worker thread, so the event loop stays responsive. If the awaiting
+  task is cancelled (Ctrl+C, GUI Stop) while a move is in flight, the wrapper sends
+  `force_stop()` at once, waits (at most `stop_wait_timeout`, default 10 s) for the
+  driver call to return, and re-raises; the first Ctrl+C halts the arm mid-move.
+- After a cancelled or failed move, or an emergency stop, the pose is treated as
+  unknown: before the next move the wrapper re-reads it from the arm and requires
+  it to be stable (`pose_settle_*`), otherwise the move is refused. A move that was
+  interrupted by `emergency_stop()` from another thread raises instead of letting
+  the flow continue, and no automatic go-home is attempted after an emergency stop.
+- After a cancelled or failed `aspirate` / `dispense` / `blow_out` the held volume
+  is unknown (`pipette_volume_known` is False; `pipette_volume` keeps the last
+  confirmed value): further `aspirate` / `dispense` calls raise `RuntimeError` until
+  `blow_out()` succeeds or `reset_pipette_volume()` is called.
 - `emergency_stop()` force-stops the Dobot command queue (the move in progress halts
   immediately, the queue is discarded, the conveyor motors stop) and switches the IKA
   heater/stirrer off. `run_flow.py` calls it on Ctrl+C, and commands no further
-  motion afterwards.
+  motion afterwards. The Picus 2 driver has no stop command: a stroke in progress
+  finishes on the pipette, and the held volume is marked unknown.
 - Configurable settle times after moves, pipette actions and balance readings
   (`wait_after_*` keyword arguments).
-- Pipette connection is retried three times with back-off.
-- `cleanup()` (also on `async with` exit or on error) disconnects every device.
+- Pipette connection is retried five times with back-off.
+- `cleanup()` (also on `async with` exit or on error) switches the IKA heater and
+  stirrer off (best effort) and then disconnects every device.
 
 ## Not included
 

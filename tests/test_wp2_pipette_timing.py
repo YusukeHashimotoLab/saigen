@@ -67,7 +67,7 @@ def test_lab_robot_dispense_returns_nominal_time():
 def test_mock_robot_reports_nominal_time():
     from src.devices.safety.mock_robot import MockLabRobot
 
-    robot = MockLabRobot()
+    robot = MockLabRobot(use_picus2=True)
     res = asyncio.run(robot.aspirate(5.0, speed=9))
     assert res["nominal_time_s"] == pytest.approx(0.45)
 
@@ -77,7 +77,7 @@ def test_executor_propagates_nominal_time():
 
     from src.devices.safety.mock_robot import MockLabRobot
 
-    robot = MockLabRobot()
+    robot = MockLabRobot(use_picus2=True)
     res = asyncio.run(
         execute_step({"action": "aspirate", "volume": 5.0, "speed": 5}, robot)
     )
