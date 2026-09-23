@@ -10,7 +10,7 @@ Dobot Magician を `pydobot` ライブラリ経由（シリアル通信）で制
 | ファイル | 役割 |
 |---|---|
 | `pydobot_controller.py` | `PyDobotController` — 本体 |
-| `pydobot_patch.py` | pydobot の不足コマンド（スライダー・コンベア等）を補うパッチ |
+| `pydobot_patch.py` | pydobot の通信部分を差し替えるパッチ（応答フレームの検証、完了待ちのタイムアウトと緊急停止での打ち切り） |
 | `dobot_config.py` | 速度プリセット・作業位置の定義（`DobotConfig`） |
 
 ## 使用例
@@ -46,12 +46,13 @@ PyDobotController.list_available_ports()
 | `move_to_initial_pos()` | 初期位置へ |
 | `pickup(...)` / `place(...)` | ピックアンドプレース |
 | `set_gripper(enabled, on)` / `set_suction_cup(enabled, on)` | エンドエフェクタ |
-| `set_speed_preset(name)` | `DobotConfig.SPEED_PRESETS` の速度に切替 |
-| `move_to_work_position(name)` / `set_home_params(x, y, z, r)` | 定義済み位置 |
+| `set_speed_preset(name)` | `DobotConfig.SPEED_PRESETS` の速度に切替（直交・Joint の両方） |
+| `set_home_params(x, y, z, r)` | ホーム位置の記録 |
 | `home(x, y, z, r, timeout_s)` | ファームウェアのホーミング（SetHOMEParams / SetHOMECmd）。完了まで待ち、戻り先を省略すると開始位置に戻る |
 | `move_slider(pos)` | リニアレール（0–1000 mm） |
 | `move_conveyer(index, speed, time_seconds)` | コンベアベルト |
 | `get_current_position()` | `[x, y, z, r]` |
+| `force_stop()` | 緊急停止（キュー強制停止・破棄・コンベア停止）。完了待ち中のスレッドも解放する |
 | `disconnect()` | 切断 |
 
 ## 注意点
@@ -64,10 +65,16 @@ PyDobotController.list_available_ports()
 - 実験用の安全ラッパ（`src/devices/safety/lab_robot.py`）はこのクラスを内部で使い、
   可動域チェックと待機時間を追加します。フロー実行時はラッパ経由で呼び出されます。
 - モーターから異音がした場合は直ちに `disconnect()` して物理的な干渉を確認してください。
+- 通信の扱い（`pydobot_patch.py`）: 応答はヘッダ `AA AA`・長さ・チェックサム・コマンド ID を
+  確認してから使い、送信前に受信バッファを捨てます。一致する応答が 2 秒以内に来なければ
+  `DobotReplyError`（`ConnectionError` の派生）。キュー付き移動の完了待ちは既定 60 秒で
+  `DobotWaitTimeout`（`PyDobotController(move_timeout_s=...)` で変更可。アームは止めないので
+  呼び出し側で `force_stop()` すること）。`force_stop()` の後は待機中の移動が
+  `DobotMoveAborted` で即座に戻ります。停止フラグは次の移動指示で下ります。
 
 ## 依存関係
 
-- `pydobot`（Copyright 2017 Luis Mesas, MIT License。`pydobot_patch.py` はこのライブラリの `_read_message` を差し替える派生コードです。全文は `THIRD_PARTY_NOTICES.md` 参照）
+- `pydobot`（Copyright 2017 Luis Mesas, MIT License。`pydobot_patch.py` はこのライブラリの `_send_command` / `_send_message` / `_read_message` / `_get_queued_cmd_current_index` / `__init__` を差し替える派生コードです。全文は `THIRD_PARTY_NOTICES.md` 参照）
 - `pyserial`
 
 Dobot 純正 DLL（DobotDll）を用いる旧ドライバはライセンス上の理由で本リポジトリには含めていません。

@@ -6,7 +6,9 @@ It builds on the following third-party components, which keep their own licenses
 ## pydobot (MIT)
 
 `src/devices/dobot/pydobot_patch.py` monkey-patches and extends
-[pydobot](https://github.com/luismesas/pydobot).
+[pydobot](https://github.com/luismesas/pydobot); its replacements of
+`Dobot._send_command`, `_send_message`, `_read_message`,
+`_get_queued_cmd_current_index` and the `__init__` wrapper are derived from pydobot 1.3.2.
 
 ```
 Copyright 2017 Luis Mesas

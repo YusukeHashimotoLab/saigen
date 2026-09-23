@@ -43,6 +43,7 @@ except ImportError:
     list_ports = None
 
 from .dobot_config import DobotConfig
+from . import pydobot_patch
 from .pydobot_patch import apply_pydobot_patch
 apply_pydobot_patch()
 
@@ -55,7 +56,8 @@ class PyDobotController:
     pydobotライブラリを使用することで複数インスタンスの同時利用が可能。
     """
 
-    def __init__(self, port_name: str = None, homing: bool = False, speed_preset: str = None, verbose: bool = False):
+    def __init__(self, port_name: str = None, homing: bool = False, speed_preset: str = None,
+                 verbose: bool = False, move_timeout_s: Optional[float] = None):
         """
         PyDobotControllerを初期化する
 
@@ -64,6 +66,10 @@ class PyDobotController:
             homing (bool): 初期化時にホーミングを実行するかどうか
             speed_preset (str): 使用する速度プリセット名
             verbose (bool): デバッグ出力を有効にするかどうか
+            move_timeout_s (float): キュー付き移動 1 回の完了待ちの上限秒。
+                省略時は pydobot_patch.DEFAULT_MOVE_TIMEOUT_S (60 s)。超えると
+                pydobot_patch.DobotWaitTimeout（アームは止めないので呼び出し側で
+                force_stop すること）。
         """
         if not PYDOBOT_AVAILABLE:
             raise ImportError("pydobot library is not installed. Run 'pip install pydobot'")
@@ -75,6 +81,7 @@ class PyDobotController:
         self.speed_preset = speed_preset or DobotConfig.DEFAULT_SPEED
         self.current_speed_config = DobotConfig.get_speed_preset(self.speed_preset)
         self.verbose = verbose
+        self.move_timeout_s = move_timeout_s
 
         self.device: Optional[Dobot] = None
         self._connected = False
@@ -90,20 +97,13 @@ class PyDobotController:
             logger.info(f"Connecting to Dobot on {self.port_name}...")
             logger.info(f"Verbose mode: {self.verbose}")
             self.device = Dobot(port=self.port_name, verbose=self.verbose)
+            if self.move_timeout_s is not None:
+                self.device.move_timeout_s = float(self.move_timeout_s)
             self._connected = True
             logger.info(f"接続状態: DobotConnect_NoError")
 
-            # 速度設定を適用
-            speed_config = self.current_speed_config
-            self.device.speed(
-                velocity=speed_config["linear_velocity"],
-                acceleration=speed_config["linear_acceleration"]
-            )
-
-            # Joint速度も適用（MOVJ_ANGLEモードの回転速度に影響）
-            jv = speed_config["joint_velocity"]
-            ja = speed_config["joint_acceleration"]
-            self.device._set_ptp_joint_params(*jv[:4], *ja[:4])
+            # 速度設定（直交・Joint）を適用
+            self._apply_speed(self.current_speed_config)
 
             if homing:
                 # pydobot 1.3.x には home() が無いので、自前の home() を使う
@@ -113,6 +113,12 @@ class PyDobotController:
         except Exception as e:
             logger.error(f"Failed to connect to Dobot on {self.port_name}: {e}")
             self._connected = False
+            if self.device is not None:
+                # 閉じずに捨てると Windows では COM ポートが掴まれたままになる
+                try:
+                    self.device.close()
+                except Exception as close_err:
+                    logger.error(f"Failed to close {self.port_name} after init error: {close_err}")
             self.device = None
             # 接続失敗を握りつぶさず送出する。以前は例外を飲み込んで device=None のまま
             # 継続していたため、以降の move_* が無音で何もせず「成功」を装う危険があった。
@@ -149,6 +155,36 @@ class PyDobotController:
             )
         return self.device
 
+    def _apply_speed(self, speed_config: dict) -> None:
+        """直交 PTP パラメータと Joint PTP パラメータの両方を設定する。
+
+        Joint 側は MOVJ_ANGLE（move_angle / rotate_relative）の回転速度に効く。
+        """
+        self.device.speed(
+            velocity=speed_config["linear_velocity"],
+            acceleration=speed_config["linear_acceleration"]
+        )
+        jv = speed_config["joint_velocity"]
+        ja = speed_config["joint_acceleration"]
+        self.device._set_ptp_joint_params(*jv[:4], *ja[:4])
+
+    def _checked_send(self, msg, what: str, wait: bool = False):
+        """_send_command の応答 None を「未確認」として ConnectionError にする。
+
+        パッチ済み pydobot は応答が無ければ自ら例外を出すが、None を返す実装
+        （未パッチ・フェイク）でも成功扱いにしない。
+        """
+        response = self.device._send_command(msg, wait=wait) if wait else self.device._send_command(msg)
+        if response is None:
+            logger.warning(f"[PyDobot] {what}: no reply from {self.port_name}; result unconfirmed")
+            raise ConnectionError(f"Dobot: {what} に応答がありません（実行を確認できません）")
+        return response
+
+    @property
+    def stop_requested(self) -> bool:
+        """force_stop() 後、次の移動指示まで True。"""
+        return self.device is not None and pydobot_patch.stop_requested(self.device)
+
     def _safe_pose(self, max_retries=3, retry_delay=0.2):
         """pose() のリトライラッパー。一時的なシリアル通信障害に対応。"""
         for attempt in range(max_retries):
@@ -156,7 +192,7 @@ class PyDobotController:
                 result = self.device.pose()
                 if result is not None:
                     return result
-            except (AttributeError, struct.error) as e:
+            except (AttributeError, struct.error, pydobot_patch.DobotReplyError) as e:
                 if attempt == max_retries - 1:
                     raise ConnectionError(
                         f"Dobot serial communication failed after {max_retries} attempts"
@@ -293,13 +329,21 @@ class PyDobotController:
         from pydobot.message import Message
         ok = True
 
+        # 0. 完了待ち中のスレッド（move_* の wait=True や home()）を即座に解放する。
+        #    停止コマンドより先に立てる（キュー破棄で index が期待値に届かなくなるため）。
+        try:
+            pydobot_patch.request_stop(self.device)
+        except Exception as e:
+            logger.error(f"[PyDobot] force_stop: could not set stop flag: {e}")
+
         # 1. QueuedCmdForceStopExec (ID:242, isQueued=0): 実行中コマンドも即時停止
         try:
             msg = Message()
             msg.id = 242
             msg.ctrl = 0x01
             msg.params = bytearray([])
-            self.device._send_command(msg)
+            if self.device._send_command(msg) is None:
+                raise ConnectionError("no reply to QueuedCmdForceStopExec")
             logger.info(f"[PyDobot] force_stop: queue force-stopped ({self.port_name})")
         except Exception as e:
             ok = False
@@ -307,7 +351,8 @@ class PyDobotController:
 
         # 2. 残キューを破棄（再開時に停止前の動作が走らないようにする）
         try:
-            self.device._set_queued_cmd_clear()
+            if self.device._set_queued_cmd_clear() is None:
+                raise ConnectionError("no reply to QueuedCmdClear")
         except Exception as e:
             ok = False
             logger.error(f"[PyDobot] force_stop: queue clear failed: {e}")
@@ -320,7 +365,8 @@ class PyDobotController:
                 msg.ctrl = 0x01
                 msg.params = bytearray([index, 0x00])  # index, isEnabled=0
                 msg.params.extend(bytearray(struct.pack('i', 0)))  # speed=0
-                self.device._send_command(msg)
+                if self.device._send_command(msg) is None:
+                    raise ConnectionError("no reply")
             except Exception as e:
                 ok = False
                 logger.error(f"[PyDobot] force_stop: EMotor {index} stop failed: {e}")
@@ -361,7 +407,10 @@ class PyDobotController:
             int: 0（互換性のため）
         """
         self._require_device()
-        self.device.grip(on)
+        # pydobot の grip() は応答を捨てるので、下位メソッドで応答を確認する
+        if self.device._set_end_effector_gripper(bool(on)) is None:
+            logger.warning(f"[PyDobot] set_gripper: no reply from {self.port_name}; state unconfirmed")
+            raise ConnectionError("Dobot: グリッパー設定に応答がありません（状態を確認できません）")
         return 0
 
     def set_suction_cup(self, enabled: bool, on: bool):
@@ -376,7 +425,9 @@ class PyDobotController:
             int: 0（互換性のため）
         """
         self._require_device()
-        self.device.suck(on)
+        if self.device._set_end_effector_suction_cup(bool(on)) is None:
+            logger.warning(f"[PyDobot] set_suction_cup: no reply from {self.port_name}; state unconfirmed")
+            raise ConnectionError("Dobot: 吸引カップ設定に応答がありません（状態を確認できません）")
         return 0
 
     def set_speed_preset(self, speed_preset: str):
@@ -397,32 +448,8 @@ class PyDobotController:
                 f"[PyDobot] set_speed_preset: 未接続のため速度設定は保持のみ ({self.port_name})"
             )
         else:
-            speed_config = self.current_speed_config
-            self.device.speed(
-                velocity=speed_config["linear_velocity"],
-                acceleration=speed_config["linear_acceleration"]
-            )
-
-    def move_to_work_position(self, position_name: str) -> bool:
-        """
-        定義済みの作業位置に移動する
-
-        Args:
-            position_name (str): 作業位置名
-
-        Returns:
-            bool: 移動成功時True
-        """
-        position = DobotConfig.get_work_position(position_name)
-        if position is None:
-            return False
-
-        logger.info(f"Moving to work position: {position_name}")
-        self.move_XYZ_abs(position["x"], position["y"], position["z"])
-        if position["r"] != 0:
-            self.move_angle(position["r"])
-
-        return True
+            # 直交だけでなく Joint も設定する（move_angle / rotate_relative の速度に効く）
+            self._apply_speed(self.current_speed_config)
 
     # Dobot プロトコル ID（Dobot Magician Communication Protocol v1.1.5）
     _ID_SET_HOME_PARAMS = 30   # SetHOMEParams: ホーミング後に戻る座標 (x, y, z, r)
@@ -494,6 +521,7 @@ class PyDobotController:
         msg.id = self._ID_SET_HOME_CMD
         msg.ctrl = 0x03
         msg.params = bytearray(struct.pack('<I', 0))  # reserved
+        pydobot_patch.clear_stop(device)   # 新しい動作の指示 → 以前の停止要求を下ろす
         response = device._send_command(msg)
         if response is None or len(response.params) < 4:
             raise ConnectionError("Dobot: SetHOMECmd に応答がありません")
@@ -504,6 +532,8 @@ class PyDobotController:
         # 3. キューの現在 index が SetHOMECmd の index に達するまで待つ
         t0 = time.monotonic()
         while True:
+            if pydobot_patch.stop_requested(device):
+                raise pydobot_patch.DobotMoveAborted("Dobot: homing wait aborted by force_stop")
             current_idx = device._get_queued_cmd_current_index()
             if current_idx >= expected_idx:
                 break
@@ -580,7 +610,7 @@ class PyDobotController:
         msg.id = 3
         msg.ctrl = 0x03
         msg.params = bytearray([0x01, 0x00])  # isWithL=1, version=0
-        self.device._send_command(msg)
+        self._checked_send(msg, "SetDeviceWithL")
 
         # 2. 現在のアーム位置を取得
         pose = self._safe_pose()
@@ -596,7 +626,7 @@ class PyDobotController:
         msg.params.extend(bytearray(struct.pack('f', pose[2])))   # z
         msg.params.extend(bytearray(struct.pack('f', pose[3])))   # rHead
         msg.params.extend(bytearray(struct.pack('f', slider_pos)))  # l
-        self.device._send_command(msg, wait=True)
+        self._checked_send(msg, "SetPTPWithLCmd", wait=True)
 
         if self.verbose:
             logger.info(f"[PyDobot] move_slider: position={slider_pos:.1f}")
@@ -628,7 +658,7 @@ class PyDobotController:
         msg.ctrl = 0x03
         msg.params = bytearray([index, 0x01])  # index, isEnabled=1
         msg.params.extend(bytearray(struct.pack('i', int(vel))))  # speed (int32)
-        self.device._send_command(msg)
+        self._checked_send(msg, "SetEMotor (start)")
 
         # 指定時間待機
         time.sleep(time_seconds)
@@ -639,7 +669,7 @@ class PyDobotController:
         msg.ctrl = 0x03
         msg.params = bytearray([index, 0x00])  # index, isEnabled=0
         msg.params.extend(bytearray(struct.pack('i', 0)))  # speed=0
-        self.device._send_command(msg)
+        self._checked_send(msg, f"SetEMotor (stop, conveyor {index} may still run)")
 
         if self.verbose:
             logger.info(f"[PyDobot] move_conveyer: index={index}, speed={speed*2:.1f}, time={time_seconds:.1f}s")

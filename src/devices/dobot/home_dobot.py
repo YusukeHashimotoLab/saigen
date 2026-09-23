@@ -27,8 +27,11 @@ XYZ 直線補間（MOVL）が正しい鉛直・水平になる。実験フロー
 * 実機では Enter を押すまでコマンドを送らない（``--yes`` で省略可）。
   Ctrl+C は緊急停止で、キューを強制停止してその場で止める。
 
-終了コード: 0 = 完了、1 = 接続失敗、2 = 戻り先が可動域外 / タイムアウト、
-130 = Ctrl+C。
+ホーミング中に例外（タイムアウト・応答なし・Ctrl+C など）が起きたら、切断する
+前に必ず force_stop() を送る。停止を確認できなければ警告を表示する。
+
+終了コード: 0 = 完了、1 = 接続失敗 / ホーミング中の通信エラー、
+2 = 戻り先が可動域外 / タイムアウト、130 = Ctrl+C。
 """
 from __future__ import annotations
 
@@ -159,6 +162,26 @@ class MockHomingController:
         pass
 
 
+def _stop_after_failure(ctrl) -> bool:
+    """home() が例外で抜けたら必ず強制停止する。
+
+    SetHOMECmd が送られた後は、CLI 側が切断してもファームウェアのホーミング
+    （大きなスイープ）は続く。停止を確認できなければ警告する。
+    """
+    print("強制停止を送ります（キュー強制停止・キュー破棄）...")
+    try:
+        ok = bool(ctrl.force_stop())
+    except Exception as e:
+        print(f"強制停止の送信に失敗: {e}")
+        ok = False
+    if ok:
+        print("強制停止を送信しました")
+    else:
+        print("警告: 停止を確認できませんでした。アームが動き続けている場合は"
+              "電源スイッチ（または USB を抜く）で止めてください。")
+    return ok
+
+
 def _connect(port: str, mock: bool):
     if mock:
         return MockHomingController(port)
@@ -234,11 +257,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               timeout_s=args.timeout)
         except KeyboardInterrupt:
             print("\nCtrl+C: 緊急停止します（キューを強制停止、その場で停止）")
-            ctrl.force_stop()
+            _stop_after_failure(ctrl)
             return 130
         except TimeoutError as e:
             print(f"タイムアウト: {e}")
+            _stop_after_failure(ctrl)
             return 2
+        except Exception as e:  # ConnectionError（応答なし）など
+            print(f"ホーミング中にエラー: {e}")
+            _stop_after_failure(ctrl)
+            return 1
 
         print(f"ホーミング完了: X={final[0]:.1f} Y={final[1]:.1f} Z={final[2]:.1f} R={final[3]:.1f}  "
               f"J1={final[4]:.1f} J2={final[5]:.1f} J3={final[6]:.1f} J4={final[7]:.1f}")

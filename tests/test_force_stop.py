@@ -19,11 +19,13 @@ class FakeDevice:
         if self.fail_send:
             raise IOError("serial gone")
         self.sent.append(msg)
+        return object()   # 応答あり
 
     def _set_queued_cmd_clear(self):
         if self.fail_clear:
             raise IOError("serial gone")
         self.clear_count += 1
+        return object()
 
 
 def make_controller(device):
@@ -87,3 +89,38 @@ def test_force_stop_partial_failure_returns_false():
     # キュー破棄が失敗しても ForceStopExec とコンベア停止は送信済み
     assert any(m.id == 242 for m in dev.sent)
     assert len([m for m in dev.sent if m.id == 135]) == 2
+
+
+class SilentDevice(FakeDevice):
+    """送信は例外にならないが応答が無い（None）。"""
+
+    def _send_command(self, msg):
+        self.sent.append(msg)
+        return None
+
+    def _set_queued_cmd_clear(self):
+        self.clear_count += 1
+        return None
+
+
+def test_force_stop_without_reply_is_not_success():
+    """応答 None を停止確認とみなさない"""
+    ctrl = make_controller(SilentDevice())
+    assert ctrl.force_stop() is False
+
+
+def test_force_stop_sets_stop_flag_before_sending():
+    from src.devices.dobot import pydobot_patch
+
+    seen = []
+
+    class Spy(FakeDevice):
+        def _send_command(self, msg):
+            seen.append(pydobot_patch.stop_requested(self))
+            return super()._send_command(msg)
+
+    dev = Spy()
+    ctrl = make_controller(dev)
+    ctrl.force_stop()
+    assert seen and all(seen), "停止フラグは停止コマンドより先に立つ"
+    assert ctrl.stop_requested
